@@ -19,6 +19,9 @@ const UPGRADE_SCRIPT = fs.readFileSync(path.join(MODULE_PROJECT, 'scripts', 'pan
 export const GITHUB_REPO = 'dofastted/vm2api'
 export const INSTALL_SCRIPT_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/install.sh`
 export const DOCKER_SOCK = '/var/run/docker.sock'
+const QUOTA_REPO = 'Hibanaw/vm2api'
+const QUOTA_UPGRADE_URL = 'https://raw.githubusercontent.com/Hibanaw/vm2api/dev/deploy/upgrade-quota.sh'
+const QUOTA_TAG_RE = /^v(\d+\.\d+\.\d+)-quota\.[a-f0-9]{12}-amd64$/
 
 const DEFAULT_CACHE_MS = 5 * 60 * 1000
 const GITHUB_TIMEOUT_MS = 8000
@@ -195,9 +198,11 @@ export function changelogSince(entries, currentVersion) {
   })
 }
 
-export function upgradeCommand(target) {
-  const tag = normalizeTag(target)
+export function upgradeCommand(target, quotaTag = process.env.VM2API_QUOTA_IMAGE_TAG) {
+  const quota = QUOTA_TAG_RE.test(quotaTag || '')
+  const tag = quota ? (QUOTA_TAG_RE.test(target || '') ? target : '') : normalizeTag(target)
   const flag = tag ? ` --version ${tag}` : ''
+  if (quota) return `curl -fsSL ${QUOTA_UPGRADE_URL} | sudo bash -s -- upgrade${flag}`
   return `curl -sSL ${INSTALL_SCRIPT_URL} | sudo bash -s -- upgrade${flag}`
 }
 
@@ -220,16 +225,17 @@ function githubHeaders() {
   return githubApiHeaders()
 }
 
-export function publicRelease(payload) {
+export function publicRelease(payload, repo = GITHUB_REPO) {
   if (!payload || typeof payload !== 'object') return null
   const tag = payload.tag_name || payload.tag || ''
-  const version = normalizeVersion(tag)
+  const quota = repo === QUOTA_REPO
+  const version = quota ? String(tag).match(QUOTA_TAG_RE)?.[1] : normalizeVersion(tag)
   if (!version) return null
   return {
     version,
-    tag: normalizeTag(version),
+    tag: quota ? tag : normalizeTag(version),
     name: payload.name || `vm2api ${version}`,
-    html_url: payload.html_url || `https://github.com/${GITHUB_REPO}/releases/tag/${normalizeTag(version)}`,
+    html_url: payload.html_url || `https://github.com/${repo}/releases/tag/${quota ? tag : normalizeTag(version)}`,
     published_at: payload.published_at || payload.created_at || null,
     notes: String(payload.body || '').trim(),
   }
@@ -239,18 +245,21 @@ export async function fetchLatestRelease({
   fetchImpl = globalThis.fetch,
   now = Date.now,
   cacheMs = DEFAULT_CACHE_MS,
+  repo = GITHUB_REPO,
 } = {}) {
   const ts = now()
-  if (releaseCache.value && ts - releaseCache.at < cacheMs) {
+  if (releaseCache.repo === repo && releaseCache.value && ts - releaseCache.at < cacheMs) {
     return { release: releaseCache.value, error: releaseCache.error, cached: true }
   }
+  if (releaseCache.repo !== repo) clearReleaseCache()
+  releaseCache.repo = repo
   if (!fetchImpl) {
     releaseCache.at = ts
     releaseCache.error = 'fetch_unavailable'
     return { release: releaseCache.value, error: 'fetch_unavailable', cached: false }
   }
   try {
-    const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
+    const res = await fetchImpl(`https://api.github.com/repos/${repo}/releases/latest`, {
       headers: githubHeaders(),
       signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     })
@@ -260,7 +269,7 @@ export async function fetchLatestRelease({
       releaseCache.error = error
       return { release: releaseCache.value, error, cached: false }
     }
-    const release = publicRelease(await res.json())
+    const release = publicRelease(await res.json(), repo)
     if (!release) {
       const error = 'github_empty'
       releaseCache.at = ts
@@ -285,31 +294,45 @@ export function clearReleaseCache() {
   releaseCache.error = null
 }
 
-export async function buildUpdateStatus({ projectRoot: root, currentVersion, upgrade, fetchImpl, now, cacheMs } = {}) {
+export async function buildUpdateStatus({
+  projectRoot: root,
+  currentVersion,
+  upgrade,
+  fetchImpl,
+  now,
+  cacheMs,
+  quotaTag = process.env.VM2API_QUOTA_IMAGE_TAG,
+} = {}) {
   const project = projectRoot(root)
   const current = currentVersion || readLocalVersion(project)
   const entries = loadChangelog(project)
-  const remote = await fetchLatestRelease({ fetchImpl, now, cacheMs })
+  const quota = QUOTA_TAG_RE.test(quotaTag || '')
+  const repo = quota ? QUOTA_REPO : GITHUB_REPO
+  const remote = await fetchLatestRelease({ fetchImpl, now, cacheMs, repo })
   const latest = remote.error ? null : remote.release?.version || null
+  const latestTag = latest ? remote.release.tag : null
   const newer = changelogSince(entries, current)
-  const updateAvailable = latest ? compareSemver(latest, current) > 0 : null
+  const order = latest ? compareSemver(latest, current) : 0
+  const updateAvailable = latest ? order > 0 || (quota && order === 0 && latestTag !== quotaTag) : null
   const needsWrap = newer.some((entry) => entry.needs_wrap_cli_sync)
   return {
     current,
-    current_tag: normalizeTag(current),
+    current_tag: quota ? quotaTag : normalizeTag(current),
     latest,
-    latest_tag: latest ? normalizeTag(latest) : null,
+    latest_tag: latestTag,
     update_available: updateAvailable,
     check_status: latest ? 'ok' : 'failed',
-    html_url: remote.release?.html_url || `https://github.com/${GITHUB_REPO}/releases`,
+    html_url: remote.release?.html_url || `https://github.com/${repo}/releases`,
     published_at: remote.release?.published_at || null,
     name: remote.release?.name || null,
     notes: remote.release?.notes || newer[0]?.title || '',
     changelog: newer,
     needs_wrap_cli_sync: needsWrap,
-    upgrade_command: upgradeCommand(updateAvailable ? latest : ''),
-    check_command: `sudo bash ${hostRoot(root)}/deploy/install.sh check`,
-    repo: GITHUB_REPO,
+    upgrade_command: upgradeCommand(updateAvailable ? latestTag : '', quotaTag),
+    check_command: quota
+      ? `curl -fsSL ${QUOTA_UPGRADE_URL} | sudo bash -s -- check`
+      : `sudo bash ${hostRoot(root)}/deploy/install.sh check`,
+    repo,
     source_error: remote.error,
     ...(upgrade ? { upgrade } : {}),
   }
@@ -411,7 +434,7 @@ export async function readHostUpgradeStatus(options = {}) {
       execFileImpl: options.execFileImpl || execFileAsync,
     })
     const target = container.Config?.Labels?.['vm2api.upgrade.target']
-    if (!isReleaseTag(target)) return null
+    if (!isReleaseTag(target) && !QUOTA_TAG_RE.test(target || '')) return null
     const state = container.State || {}
     return {
       state: state.Status === 'exited' ? (state.ExitCode === 0 ? 'succeeded' : 'failed') : 'running',
@@ -442,8 +465,14 @@ export async function startHostUpgrade({
   execFileImpl = execFileAsync,
   fetchImpl,
   now,
+  quotaTag = process.env.VM2API_QUOTA_IMAGE_TAG,
 } = {}) {
-  const requested = version != null && String(version).trim() !== '' ? parseReleaseTag(version) : null
+  const quota = QUOTA_TAG_RE.test(quotaTag || '')
+  const requested = quota
+    ? QUOTA_TAG_RE.test(version || '')
+      ? { tag: version, arch: 'amd64' }
+      : null
+    : parseReleaseTag(version)
   if (version != null && String(version).trim() !== '' && !requested) {
     return {
       status: 400,
@@ -463,28 +492,28 @@ export async function startHostUpgrade({
       error: { message: `版本后缀 -${requested.arch} 与控制面架构 ${hostArch} 不符`, code: 'arch_mismatch' },
     }
   }
-  const status = await buildUpdateStatus({ projectRoot: root, currentVersion, fetchImpl, now })
-  if (!requested && status.source_error) {
+  const status = await buildUpdateStatus({ projectRoot: root, currentVersion, fetchImpl, now, quotaTag })
+  if ((quota || !requested) && status.source_error) {
     return {
       status: 502,
       error: { message: '无法检查最新版本，请稍后重试', code: 'release_check_failed' },
     }
   }
   const target = requested ? requested.tag : status.latest_tag
-  if (!isReleaseTag(target)) {
+  if (quota ? !QUOTA_TAG_RE.test(target || '') || target !== status.latest_tag : !isReleaseTag(target)) {
     return {
       status: 400,
       error: { message: '无效版本', code: 'invalid_version' },
     }
   }
-  const command = upgradeCommand(target)
+  const command = upgradeCommand(target, quotaTag)
   if (!confirm) {
     return {
       status: 200,
       data: { ...status, started: false, target, command },
     }
   }
-  if (!status.update_available && !version) {
+  if (!status.update_available && (quota || !version)) {
     return {
       status: 200,
       data: { ...status, started: false, target, command, message: 'already_latest' },

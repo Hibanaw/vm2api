@@ -153,7 +153,7 @@ export function AboutPane() {
           </dl>
           {data?.source_error ? (
             <p className='text-sm text-muted-foreground'>
-              GitHub 不可达（{data.source_error}）。仍可复制宿主机命令。
+              无法读取 GitHub 发布（{data.source_error}）。
             </p>
           ) : null}
           {updateRunning ? (
@@ -185,7 +185,7 @@ export function AboutPane() {
               rel='noreferrer'
               className='inline-flex items-center gap-1 text-sm text-primary hover:underline'
             >
-              GitHub Release
+              {data.repo} Release
               <ExternalLink className='size-3.5' />
             </a>
           ) : null}
@@ -203,13 +203,13 @@ export function AboutPane() {
             遥测重建镜像并换容器，不改凭证和指纹。
           </p>
           <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
-            {data?.upgrade_command ||
-              'curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade'}
+            {data?.upgrade_command || '正在读取升级命令…'}
           </pre>
           <div className='flex flex-wrap gap-2'>
             <Button
               size='sm'
               variant='outline'
+              disabled={!data?.upgrade_command}
               onClick={() => {
                 const command = data?.upgrade_command
                 if (!command) return

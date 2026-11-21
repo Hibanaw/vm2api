@@ -18,6 +18,7 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar'
+import { versionQueryOptions } from '@/features/settings/queries'
 import { Button } from '../ui/button'
 
 const CHIP_CLASS =
@@ -125,18 +126,38 @@ function VersionChip({ version }: { version?: string }) {
 }
 
 function UpdateNotice({ version }: { version?: string }) {
+  const quotaBuild = import.meta.env.VITE_VM2API_QUOTA_CHANNEL === '1'
   const [dismissed, setDismissed] = useState(readDismissedRelease)
-  const { data: latest } = useQuery({
+  const { data: official } = useQuery({
     queryKey: ['github-latest-release'],
     queryFn: () => fetchLatestRelease(REPO_URL),
-    enabled: Boolean(version),
+    enabled: Boolean(version) && !quotaBuild,
     staleTime: RELEASE_CHECK_INTERVAL_MS,
     refetchInterval: RELEASE_CHECK_INTERVAL_MS,
     refetchIntervalInBackground: true,
     refetchOnWindowFocus: false,
     retry: false,
   })
-  if (!latest || !hasNewerRelease(version, latest, dismissed)) return null
+  const { data: quota } = useQuery({
+    ...versionQueryOptions(),
+    enabled: Boolean(version) && quotaBuild,
+    refetchInterval: RELEASE_CHECK_INTERVAL_MS,
+    retry: false,
+  })
+  const latest = quotaBuild
+    ? quota?.update_available &&
+      quota.latest_tag &&
+      quota.latest_tag !== dismissed
+      ? {
+          version: quota.latest_tag.replace(/^v/, ''),
+          url: quota.html_url,
+          id: quota.latest_tag,
+        }
+      : null
+    : official && hasNewerRelease(version, official, dismissed)
+      ? { ...official, id: official.version }
+      : null
+  if (!latest) return null
   return (
     <div
       role='status'
@@ -164,8 +185,8 @@ function UpdateNotice({ version }: { version?: string }) {
         title='关闭此提示'
         className='grid size-6 shrink-0 cursor-pointer place-items-center rounded-md opacity-70 outline-hidden hover:bg-amber-500/15 hover:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring'
         onClick={() => {
-          writeDismissedRelease(latest.version)
-          setDismissed(latest.version)
+          writeDismissedRelease(latest.id)
+          setDismissed(latest.id)
         }}
       >
         <X aria-hidden className='size-3.5' />

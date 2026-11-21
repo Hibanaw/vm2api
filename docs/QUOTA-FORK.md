@@ -8,4 +8,12 @@
 
 保留 fork 默认分支作为补丁来源。版本跟踪在 Actions 中完成，该工作流不会合并上游分支或推送提交。手动同步官方分支后，需要检查工作流中的补丁基准和差异范围。镜像首次发布后，在 GitHub Packages 确认服务器的拉取权限。
 
-服务器部署是独立步骤。固定 Compose 的镜像版本，检查对应官方升级说明中涉及的数据迁移和槽位 kernel、CLI 同步，再切换镜像。需要回退时，使用上次已验证可用的镜像标签。
+Actions 在镜像可匿名拉取后发布 [fork Release](https://github.com/Hibanaw/vm2api/releases)。带定制更新入口的镜像只从这些 Release 检查更新；「从面板发起」使用相同的镜像标签。
+
+首次从官方镜像切换，或在宿主机手动更新时，运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Hibanaw/vm2api/dev/deploy/upgrade-quota.sh | sudo bash -s -- upgrade
+```
+
+脚本识别名为 `vm2api` 的 amd64 Compose 容器，备份 `.env` 和 SQLite 数据库，再重建控制面并验证原本健康的槽位。可以用 `check` 查看最新标签，或者用 `upgrade --version TAG` 选择已发布的版本。更新日志可用 `docker logs vm2api-upgrade-vm2api` 查看，备份留在服务器的 `deployment-backups/`。

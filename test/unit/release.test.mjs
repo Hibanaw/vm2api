@@ -282,6 +282,49 @@ test('publicRelease ignores malformed GitHub payloads', () => {
   assert.equal(publicRelease({ tag_name: 'v1.2.7' }).version, '1.2.7')
 })
 
+test('quota images check fork releases and pass the exact image tag to the helper', async (t) => {
+  clearReleaseCache()
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-quota-release-'))
+  fs.writeFileSync(path.join(tmp, 'VERSION'), '1.4.171\n')
+  t.after(() => {
+    fs.rmSync(tmp, { recursive: true, force: true })
+    clearReleaseCache()
+  })
+  const quotaTag = 'v1.4.171-quota.111111111111-amd64'
+  const target = 'v1.4.171-quota.222222222222-amd64'
+  const docker = dockerFixture(tmp)
+  const options = {
+    ...docker.options,
+    projectRoot: tmp,
+    currentVersion: '1.4.171',
+    quotaTag,
+    arch: 'amd64',
+    fetchImpl: async (url) => {
+      assert.equal(url, 'https://api.github.com/repos/Hibanaw/vm2api/releases/latest')
+      return { ok: true, json: async () => ({ tag_name: target }) }
+    },
+  }
+  const status = await buildUpdateStatus(options)
+  assert.equal(status.current_tag, quotaTag)
+  assert.equal(status.latest_tag, target)
+  assert.equal(status.update_available, true)
+  assert.match(status.upgrade_command, /Hibanaw\/vm2api\/dev\/deploy\/upgrade-quota\.sh/)
+  assert.ok(status.upgrade_command.endsWith(` --version ${target}`))
+
+  const official = await startHostUpgrade({ ...options, confirm: true, version: 'v1.4.172' })
+  assert.equal(official.status, 400)
+  const invalid = await startHostUpgrade({ ...options, confirm: true, version: 'v1.4.172-quota.333333333333-amd64' })
+  assert.equal(invalid.status, 400)
+  assert.equal(
+    docker.calls.some(({ args }) => args[0] === 'run'),
+    false,
+  )
+  const upgrade = await startHostUpgrade({ ...options, confirm: true, version: target })
+  assert.equal(upgrade.status, 202)
+  const run = docker.calls.find(({ args }) => args[0] === 'run')
+  assert.ok(run.args.includes(target))
+})
+
 test('VERSION is the only application release version source', () => {
   const root = path.resolve(import.meta.dirname, '../..')
   const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim()

@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'Hibanaw/vm2api'
+    if: github.repository == 'Hibanaw/vm2api' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -69,14 +69,19 @@ jobs:
             src/lib/pool/credential-weight.mjs
             src/lib/pool/pool-scheduler.mjs
             src/lib/admin/panel-api.mjs
+            src/lib/admin/release.mjs
+            scripts/panel-upgrade.sh
           )
           git -C fork merge-base --is-ancestor "$baseline" HEAD
-          git -C fork diff --binary -U1 "$baseline" HEAD -- \
+          git -C fork -c core.abbrev=12 diff --binary -U1 "$baseline" HEAD -- \
             "${backend[@]}" \
             web/src/features/settings/pool-pane.tsx \
             web/src/features/settings/pool-live-panel.tsx \
             web/src/types/panel-vm.ts \
-            test/unit/pool-scheduler.test.mjs > "$RUNNER_TEMP/quota.patch"
+            web/src/features/settings/about-pane.tsx \
+            web/src/components/layout/app-title.tsx \
+            test/unit/pool-scheduler.test.mjs \
+            test/unit/release.test.mjs > "$RUNNER_TEMP/quota.patch"
           test -s "$RUNNER_TEMP/quota.patch"
           test "v$(tr -d '[:space:]' < upstream/VERSION)" = "$UPSTREAM_TAG"
           mkdir -p image
@@ -98,9 +103,13 @@ jobs:
         working-directory: upstream
         run: |
           npm ci --no-audit --no-fund
-          node --test test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs
+          node --test test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs test/unit/release.test.mjs
+          sh -n scripts/panel-upgrade.sh
+          bash -n "$GITHUB_WORKSPACE/fork/deploy/upgrade-quota.sh"
       - name: Build console
         working-directory: upstream/web
+        env:
+          VITE_VM2API_QUOTA_CHANNEL: '1'
         run: |
           npm exec --yes --package=pnpm@10.30.0 -- pnpm install --frozen-lockfile
           npm exec --yes --package=pnpm@10.30.0 -- pnpm build
@@ -117,7 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: read
+      contents: write
       packages: write
     env:
       UPSTREAM_TAG: ${{ needs.verify.outputs.tag }}
@@ -154,8 +163,11 @@ jobs:
           trap 'docker rm "$cid" >/dev/null' EXIT
           mkdir "$RUNNER_TEMP/base"
           docker cp "$cid:/opt/vm2api/src" "$RUNNER_TEMP/base/src"
+          mkdir -p "$RUNNER_TEMP/base/scripts"
+          docker cp "$cid:/opt/vm2api/scripts/panel-upgrade.sh" "$RUNNER_TEMP/base/scripts/"
           (cd "$RUNNER_TEMP/base" && sha256sum --check "$GITHUB_WORKSPACE/image/base-files.sha256")
           docker build --platform linux/amd64 --build-arg "UPSTREAM_IMAGE=$digest" \
+            --build-arg "QUOTA_IMAGE_TAG=$IMAGE_TAG-amd64" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.base.name=$ref" \
@@ -169,3 +181,29 @@ jobs:
           else
             echo "Verified \`$image\` (local build only)" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Publish fork release after image is available
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE_TAG-amd64"
+          package="${GITHUB_REPOSITORY_OWNER,,}/vm2api-quota"
+          registry_token=$(curl -fsS --max-time 20 "https://ghcr.io/token?service=ghcr.io&scope=repository:$package:pull" | jq -er .token)
+          echo "::add-mask::$registry_token"
+          curl -fsS --max-time 20 -o /dev/null \
+            -H "Authorization: Bearer $registry_token" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$package/manifests/$tag"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+              --title "vm2api quota $UPSTREAM_TAG (amd64)" \
+              --notes "Image: ghcr.io/$package:$tag. Upstream: https://github.com/dofastted/vm2api/releases/tag/$UPSTREAM_TAG"
+          fi
+          current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [[ "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-quota\.[a-f0-9]{12}-amd64$ ]]; then
+            current_version="${current%%-quota.*}"
+            [[ $(printf '%s\n' "$current_version" "$UPSTREAM_TAG" | sort -V | tail -1) == "$UPSTREAM_TAG" ]] || exit 0
+          fi
+          latest_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+          [[ "$latest_commit" != "$GITHUB_SHA" ]] || gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest

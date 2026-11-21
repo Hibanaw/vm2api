@@ -10,6 +10,14 @@ ARCH=$6
 shift 6
 cd "$ROOT"
 
+QUOTA_IMAGE=
+VERSION_TAG=$TAG
+if printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-quota\.[a-f0-9]{12}-amd64$'; then
+  [ "$ARCH" = amd64 ] && [ ! -d .git ] || { echo 'Quota upgrades require an amd64 image deployment' >&2; exit 1; }
+  QUOTA_IMAGE=ghcr.io/hibanaw/vm2api-quota
+  VERSION_TAG=${TAG%%-quota.*}
+fi
+
 COMPOSE_FILE_LIST=''
 for file do
   if [ -n "$COMPOSE_FILE_LIST" ]; then COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:"; fi
@@ -137,14 +145,45 @@ if [ -d .git ]; then
 else
   IMAGE_TAG=$TAG
   [ "$ARCH" != arm64 ] || IMAGE_TAG=$TAG-arm64
-  touch .env
-  if grep -q '^VM2API_IMAGE_TAG=' .env; then
-    sed -i.bak "s|^VM2API_IMAGE_TAG=.*|VM2API_IMAGE_TAG=$IMAGE_TAG|" .env
-    rm -f .env.bak
-  else
-    printf '\nVM2API_IMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env
+  if [ -n "$QUOTA_IMAGE" ]; then
+    docker pull "$QUOTA_IMAGE:$IMAGE_TAG"
+    image_identity=$(docker image inspect "$QUOTA_IMAGE:$IMAGE_TAG" --format '{{range .Config.Env}}{{println .}}{{end}}' |
+      grep -Fx "VM2API_QUOTA_IMAGE_TAG=$IMAGE_TAG")
+    [ -n "$image_identity" ]
+    umask 077
+    mkdir -p deployment-backups
+    backup=$(mktemp -d deployment-backups/quota-upgrade.XXXXXX)
+    cp -p .env "$backup/.env"
+    docker exec "$CONTAINER" node --input-type=module -e '
+      import { DatabaseSync, backup } from "node:sqlite"
+      import path from "node:path"
+      process.umask(0o077)
+      const source = new DatabaseSync(process.env.KIN_DB_PATH || path.join(process.env.KIN_DATA_DIR || "/opt/vm2api/data", "kin.db"), { readOnly: true })
+      await backup(source, "/tmp/vm2api-quota-" + process.argv[1] + ".db")
+      source.close()
+    ' "${backup##*/}"
+    docker cp "$CONTAINER:/tmp/vm2api-quota-${backup##*/}.db" "$backup/kin.db"
+    chmod 600 "$backup/kin.db"
+    docker exec "$CONTAINER" rm -f "/tmp/vm2api-quota-${backup##*/}.db"
+    echo "Upgrade backup: $backup"
   fi
-  compose pull vm2api
+  if [ -n "$QUOTA_IMAGE" ]; then
+    pending_env=$(mktemp "$ROOT/.env.quota.XXXXXX")
+    trap 'rm -f "$pending_env"' EXIT
+    sed '/^VM2API_IMAGE=/d; /^VM2API_IMAGE_TAG=/d' .env > "$pending_env"
+    printf '\nVM2API_IMAGE=%s\nVM2API_IMAGE_TAG=%s\n' "$QUOTA_IMAGE" "$IMAGE_TAG" >> "$pending_env"
+    resolved_image=$(compose --env-file "$pending_env" config --images vm2api)
+    [ "$resolved_image" = "$QUOTA_IMAGE:$IMAGE_TAG" ] || { echo 'Compose does not select the quota image' >&2; exit 1; }
+  else
+    touch .env
+    if grep -q '^VM2API_IMAGE_TAG=' .env; then
+      sed -i.bak "s|^VM2API_IMAGE_TAG=.*|VM2API_IMAGE_TAG=$IMAGE_TAG|" .env
+      rm -f .env.bak
+    else
+      printf '\nVM2API_IMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env
+    fi
+    compose pull vm2api
+  fi
   # Image upgrades do not refresh Compose files. Add only the bind missing
   # from the effective configuration; leave operator files and mounts alone.
   CONFIG=$(compose config --format json vm2api)
@@ -177,7 +216,19 @@ EOF
   fi
 fi
 
-compose up -d --no-deps --force-recreate vm2api
+if [ -n "$QUOTA_IMAGE" ]; then
+  mv -f "$pending_env" .env
+  trap - EXIT
+  if ! compose up -d --no-deps --force-recreate --pull never vm2api; then
+    if [ "$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" = "$PREVIOUS_ID" ]; then
+      cp -p "$backup/.env" .env
+    fi
+    echo "Compose failed. See backup: $backup" >&2
+    exit 1
+  fi
+else
+  compose up -d --no-deps --force-recreate vm2api
+fi
 CURRENT_ID=$(docker inspect --format '{{.Id}}' "$CONTAINER")
 if [ "$CURRENT_ID" = "$PREVIOUS_ID" ]; then
   echo 'Compose did not replace the running control plane' >&2
@@ -188,7 +239,7 @@ fi
 attempt=0
 while [ "$attempt" -lt 45 ]; do
   if probe verify "$TAG" "$BASELINE"; then
-    [ -d .git ] || printf '%s\n' "${TAG#v}" > VERSION
+    [ -d .git ] || printf '%s\n' "${VERSION_TAG#v}" > VERSION
     # Slot payloads through the new server (it alone holds the cluster links):
     # local slots take the new kernel/cli-node files, node slots move onto a
     # rebuilt slot image, then every slot restarts kin-worker/kin-egress.
