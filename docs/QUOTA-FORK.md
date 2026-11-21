@@ -4,7 +4,7 @@
 
 [发布工作流](../.github/workflows/quota-image.yml) 在 fork 的默认分支生效。将改动推送到默认分支后，在 GitHub 的 Actions 页启用已禁用的 fork 工作流，然后手动运行一次 **Track vm2api releases and publish quota image**。可指定官方版本，例如 `v1.4.171`，或留空使用最新正式版。关闭 Publish 可以验证镜像构建而不发布。
 
-工作流每 6 小时检查官方 Release，将 fork 的改动应用到正式标签，运行调度测试，重新构建控制台，并在同版本官方 amd64 镜像上替换应用文件。镜像的标签包含官方版本和补丁摘要，例如 `ghcr.io/hibanaw/vm2api:v1.4.171-quota.<hash>-amd64`。补丁冲突、官方镜像尚未发布、源码与镜像不匹配或测试失败都会停止发布。
+工作流每 6 小时检查官方 Release，将 fork 的改动应用到正式标签，运行调度测试，重新构建控制台，并在同版本官方 amd64 镜像上替换应用文件。镜像发布到独立的 `vm2api-quota` 包，标签包含官方版本和补丁摘要，例如 `ghcr.io/hibanaw/vm2api-quota:v1.4.171-quota.<hash>-amd64`。补丁冲突、官方镜像尚未发布、源码与镜像不匹配或测试失败都会停止发布。
 
 保留 fork 默认分支作为补丁来源。版本跟踪在 Actions 中完成，该工作流不会合并上游分支或推送提交。手动同步官方分支后，需要检查工作流中的补丁基准和差异范围。镜像首次发布后，在 GitHub Packages 确认服务器的拉取权限。
 
