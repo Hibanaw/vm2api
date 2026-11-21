@@ -60,7 +60,7 @@ import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
-import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
+import { resolveCredentialScheduleLevel, weeklyPaceScore } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
   evaluateAccount,
@@ -2115,6 +2115,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     weight: v.weight ?? 1,
     schedule_level: scheduleLevel.level,
     schedule_level_mode: scheduleLevel.mode,
+    weekly_pace_score: isCodex ? null : weeklyPaceScore(acc?.unified),
     active_hours: activeHours,
     active_hours_timezone: activeHours ? activeHoursZone : null,
     // Window state on its own: availability may carry a stronger reason (cool, quota).

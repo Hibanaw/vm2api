@@ -3471,6 +3471,89 @@ function preferVm01(root) {
   fs.writeFileSync(file, JSON.stringify(vm))
 }
 
+test('weekly pace allocates a new Claude conversation by quota per day and keeps an existing pin', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  preferVm01(root)
+  const now = Date.now()
+  const day = 86400_000
+  const account = (utilization, days) => ({
+    unified: { official: { '7d': { utilization, reset: now + days * day } } },
+  })
+  const repo = new Map([
+    ['account-1', account(0.3, 6)],
+    ['account-2', account(0.6, 2)],
+  ])
+  const pool = scheduler(root, {
+    accountQuota: { repo, canAccept: () => ({ ok: true }) },
+    config: { strategy: 'weekly_pace' },
+    stickyRouter: {
+      resolve: (key) => (key === 'existing' ? { vmId: 'vm-01', accountId: 'account-1' } : null),
+    },
+  })
+  const fresh = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:weekly-fresh',
+    stickyKey: 'fresh',
+    deviceVmId: 'vm-01',
+    allowWait: false,
+  })
+  assert.equal(fresh.vmId, 'vm-02')
+  assert.equal(fresh.selectionReason, 'weekly_pace')
+  fresh.release()
+
+  const existing = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:weekly-existing',
+    stickyKey: 'existing',
+    allowWait: false,
+  })
+  assert.equal(existing.vmId, 'vm-01')
+  assert.equal(existing.selectionReason, 'sticky')
+  existing.release()
+
+  repo.set('account-2', account(0, -1))
+  const unknown = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:weekly-missing-quota',
+    allowWait: false,
+  })
+  assert.equal(unknown.vmId, 'vm-01')
+  unknown.release()
+})
+
+test('weekly pace ranks all eligible VMs when a new Claude conversation leaves the queue', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const account = (utilization, days) => ({
+    unified: { official: { '7d': { utilization, reset: now + days * 86400_000 } } },
+  })
+  const pool = scheduler(root, {
+    accountQuota: {
+      repo: new Map([
+        ['account-1', account(0.3, 6)],
+        ['account-2', account(0.6, 2)],
+      ]),
+      canAccept: () => ({ ok: true }),
+    },
+    config: { strategy: 'weekly_pace' },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  const ticket = pool.enqueueTicket({
+    seatKey: 'seat:sess:weekly-queued',
+    kind: 'global',
+    vmId: null,
+    candidates: new Map(candidates.map((candidate) => [candidate.vmId, candidate])),
+    deadline: now + 30000,
+    newConversation: true,
+  })
+  pool.planner.pump('vm-01')
+  assert.equal(ticket.granted?.candidate.vmId, 'vm-02')
+  pool.planner.forgetGranted(ticket)
+  ticket.granted.reservation.release()
+})
+
 test('a continuing conversation keeps its own VM over priority and device with either spill policy', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

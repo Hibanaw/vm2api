@@ -463,6 +463,7 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  weekly_pace_score?: number | null
   /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
   active_hours?: VmActiveHours | null
   /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */

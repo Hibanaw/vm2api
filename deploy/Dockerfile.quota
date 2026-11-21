@@ -1,0 +1,6 @@
+ARG UPSTREAM_IMAGE
+FROM ${UPSTREAM_IMAGE}
+COPY src/lib/pool/credential-weight.mjs src/lib/pool/pool-scheduler.mjs /opt/vm2api/src/lib/pool/
+COPY src/lib/admin/panel-api.mjs /opt/vm2api/src/lib/admin/
+RUN rm -rf /opt/vm2api/web/dist
+COPY web-dist/ /opt/vm2api/web/dist/

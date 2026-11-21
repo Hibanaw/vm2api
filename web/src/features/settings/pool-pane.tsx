@@ -70,12 +70,18 @@ function numOf(source: Obj, key: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback
 }
 
+type SeatStrategy = 'balanced' | 'fill' | 'weekly_pace'
+
+function seatStrategy(value: unknown): SeatStrategy {
+  return value === 'fill' || value === 'weekly_pace' ? value : 'balanced'
+}
+
 const STRATEGIES: {
-  id: 'balanced' | 'fill'
+  id: SeatStrategy
   title: string
   desc: string
-  demo: number[]
-  next: number
+  demo?: number[]
+  next?: number
 }[] = [
   {
     id: 'balanced',
@@ -91,14 +97,19 @@ const STRATEGIES: {
     demo: [4, 3, 1],
     next: 1,
   },
+  {
+    id: 'weekly_pace',
+    title: '周额度进度',
+    desc: '新对话优先选「7 天剩余额度比例 ÷ 本周期剩余时间比例」最高的可用账号。已有对话保持原账号。',
+  },
 ]
 
 function StrategyCards({
   value,
   onChange,
 }: {
-  value: 'balanced' | 'fill'
-  onChange: (next: 'balanced' | 'fill') => void
+  value: SeatStrategy
+  onChange: (next: SeatStrategy) => void
 }) {
   return (
     <div
@@ -139,27 +150,29 @@ function StrategyCards({
             <p className='text-xs leading-5 text-muted-foreground'>
               {strategy.desc}
             </p>
-            <div className='grid grid-cols-3 gap-2 rounded-md bg-muted/40 p-2'>
-              {strategy.demo.map((used, index) => (
-                <div key={index} className='space-y-1'>
-                  <div
-                    className={cn(
-                      'text-[10px] text-muted-foreground',
-                      index === strategy.next && 'font-medium text-foreground'
-                    )}
-                  >
-                    VM {String.fromCharCode(65 + index)}
-                    {index === strategy.next ? ' ← 下一席' : ''}
+            {strategy.demo ? (
+              <div className='grid grid-cols-3 gap-2 rounded-md bg-muted/40 p-2'>
+                {strategy.demo.map((used, index) => (
+                  <div key={index} className='space-y-1'>
+                    <div
+                      className={cn(
+                        'text-[10px] text-muted-foreground',
+                        index === strategy.next && 'font-medium text-foreground'
+                      )}
+                    >
+                      VM {String.fromCharCode(65 + index)}
+                      {index === strategy.next ? ' ← 下一席' : ''}
+                    </div>
+                    <SeatCells
+                      used={used}
+                      max={4}
+                      next={index === strategy.next}
+                      size='sm'
+                    />
                   </div>
-                  <SeatCells
-                    used={used}
-                    max={4}
-                    next={index === strategy.next}
-                    size='sm'
-                  />
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            ) : null}
           </button>
         )
       })}
@@ -427,7 +440,8 @@ export function PoolPane({
   saving = false,
   pending = false,
 }: PoolPaneProps) {
-  const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
+  const strategy = seatStrategy(pool.strategy)
+  const strategyTitle = STRATEGIES.find((item) => item.id === strategy)?.title
   const resetPriority = pool.reset_priority !== false
   const seatCap = Math.min(
     SEAT_CAP_MAX,
@@ -562,7 +576,7 @@ export function PoolPane({
         <SummaryButton
           icon={Layers}
           title='分配策略'
-          value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
+          value={`${strategyTitle}${resetPriority && strategy !== 'weekly_pace' ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
@@ -656,14 +670,14 @@ export function PoolPane({
             {open === 'strategy' ? (
               <>
                 <StrategyCards
-                  value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
+                  value={seatStrategy(poolDraft.strategy)}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
                   <div>
                     <Label htmlFor='pool-reset-priority'>临近重置优先</Label>
                     <p className='text-xs leading-5 text-muted-foreground'>
-                      开启：离周额度刷新越近的账号级别越高，先被用掉。关闭：所有自动级别的账号同一级，按上面的策略平均分配。手动级别不受影响。
+                      开启后按距重置的天数提高自动级别。周额度进度模式优先比分数，同分时再按级别分配。
                     </p>
                   </div>
                   <Switch

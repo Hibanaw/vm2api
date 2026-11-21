@@ -39,7 +39,7 @@ import { splitBlocksModel } from './weekly-split.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
-import { resolveCredentialScheduleLevel, setResetPriorityEnabled } from './credential-weight.mjs'
+import { resolveCredentialScheduleLevel, setResetPriorityEnabled, weeklyPaceScore } from './credential-weight.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, vmMatchesOwnerScope, vmOwnerId } from '../admin/resource-owner.mjs'
 import { keyAllowsVm } from '../admin/key-scope.mjs'
 import {
@@ -133,7 +133,7 @@ function clampWaitTimeoutMs(value, fallback) {
 export function normalizePoolRouting(pool = {}) {
   const next = { ...(pool && typeof pool === 'object' ? pool : {}) }
   delete next.max_waiters_per_account
-  next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
+  next.strategy = ['fill', 'weekly_pace'].includes(next.strategy) ? next.strategy : 'balanced'
   next.session_affinity_first = next.session_affinity_first === true
   // Fresh-account isolation window (see DEFAULT_POOL_ROUTING). 0 disables.
   next.fresh_account_isolation_ms = clampNumber(
@@ -969,6 +969,7 @@ export class PoolScheduler extends EventEmitter {
     const failoverDeadline = Number(deadline) || Number.POSITIVE_INFINITY
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     const machineKey = String(deviceKey || '').trim()
+    const newConversation = !familyVm && !this.continuingVmIds({ seatKey, stickyKey, stickyKeys }).size
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
     let stickyCleared = false
     let stickyBorrowed = false
@@ -1168,6 +1169,7 @@ export class PoolScheduler extends EventEmitter {
               homes,
               stickyHome,
               deviceKey: machineKey,
+              newConversation,
             })
             if (granted) return finish(granted)
             if (!candidates.length) {
@@ -1178,7 +1180,7 @@ export class PoolScheduler extends EventEmitter {
             const waitTier = highestPriorityCandidates(candidates.filter((candidate) => !avoided(candidate)))
             const home =
               stickyHome ||
-              homes
+              (newConversation && this.config.strategy === 'weekly_pace' ? [] : homes)
                 .map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId))
                 .find((candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason)))
             ticket = home
@@ -1202,6 +1204,8 @@ export class PoolScheduler extends EventEmitter {
                   candidates: byVm,
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
                   avoided,
+                  newConversation,
+                  deviceKey: machineKey,
                 })
           } else if (ticket.kind === 'conc') {
             // Its seat moved away: wait for a new seat on the same terms as a new device.
@@ -1246,11 +1250,18 @@ export class PoolScheduler extends EventEmitter {
    * A continuing session keeps its home even if a higher level has room.
    * New sessions try levels in descending order, with soft affinity within a level.
    */
-  openNewSeat(seatKey, candidates, { avoided, homes = [], stickyHome = null, deviceKey = '' }) {
+  openNewSeat(
+    seatKey,
+    candidates,
+    { avoided, homes = [], stickyHome = null, deviceKey = '', newConversation = false },
+  ) {
     const openable = this.openableCandidates(candidates, avoided)
     if (stickyHome) {
       if (!openable.includes(stickyHome)) return null
       return this.claimSeat(seatKey, stickyHome, 'sticky', deviceKey)
+    }
+    if (newConversation && this.config.strategy === 'weekly_pace') {
+      return this.claimWeeklyPaceSeat(seatKey, openable, deviceKey)
     }
     const ranked = this.planner.rank(openable)
     for (const priority of new Set(ranked.map((candidate) => candidate.priority))) {
@@ -1283,6 +1294,24 @@ export class PoolScheduler extends EventEmitter {
         }
       }
       if (homeFull) return null
+    }
+    return null
+  }
+
+  claimWeeklyPaceSeat(seatKey, candidates, deviceKey) {
+    const now = Date.now()
+    const ranked = this.planner
+      .rank(candidates)
+      .map((candidate) => ({ candidate, score: weeklyPaceScore(candidate.account?.unified, now) ?? -1 }))
+      .sort((left, right) => right.score - left.score)
+    for (const strict of [true, false]) {
+      for (const draining of [false, true]) {
+        for (const { candidate } of ranked) {
+          if (candidate.draining !== draining || !hostAdmits(candidate, strict)) continue
+          const granted = this.claimSeat(seatKey, candidate, 'weekly_pace', deviceKey)
+          if (granted) return granted
+        }
+      }
     }
     return null
   }
@@ -1330,7 +1359,19 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  enqueueTicket({ signal, seatKey, kind, vmId, candidates, deadline, stickyUntil = null, requestDeadline, avoided }) {
+  enqueueTicket({
+    signal,
+    seatKey,
+    kind,
+    vmId,
+    candidates,
+    deadline,
+    stickyUntil = null,
+    requestDeadline,
+    avoided,
+    newConversation = false,
+    deviceKey = '',
+  }) {
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError([...candidates.keys()])
     const ticket = {
       seatKey,
@@ -1356,23 +1397,33 @@ export class PoolScheduler extends EventEmitter {
         // the granting phase before its deadline is replaced.
         const grantingDeadline = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
         const target = ticket.candidates.get(id)
-        const higher =
-          ticket.kind === 'global' && target
-            ? this.planner.rank(
-                [...ticket.candidates.values()].filter(
-                  (candidate) =>
-                    candidate.priority > target.priority &&
-                    !avoided?.(candidate) &&
-                    !this.planner.hasSeatWaiters(candidate.vmId, { before: ticket }) &&
-                    !this.planner.hasConcWaiters(candidate.vmId),
-                ),
-              )
-            : []
         let granted = null
-        for (const candidate of [...higher, target]) {
-          if (!candidate || (ticket.kind === 'global' && avoided?.(candidate))) continue
-          granted = this.claimSeat(ticket.seatKey, candidate, 'queued')
-          if (granted) break
+        if (ticket.kind === 'global' && newConversation && this.config.strategy === 'weekly_pace') {
+          const openable = [...ticket.candidates.values()].filter(
+            (candidate) =>
+              !avoided?.(candidate) &&
+              !this.planner.hasSeatWaiters(candidate.vmId, { before: ticket }) &&
+              !this.planner.hasConcWaiters(candidate.vmId),
+          )
+          granted = this.claimWeeklyPaceSeat(ticket.seatKey, openable, deviceKey)
+        } else {
+          const higher =
+            ticket.kind === 'global' && target
+              ? this.planner.rank(
+                  [...ticket.candidates.values()].filter(
+                    (candidate) =>
+                      candidate.priority > target.priority &&
+                      !avoided?.(candidate) &&
+                      !this.planner.hasSeatWaiters(candidate.vmId, { before: ticket }) &&
+                      !this.planner.hasConcWaiters(candidate.vmId),
+                  ),
+                )
+              : []
+          for (const candidate of [...higher, target]) {
+            if (!candidate || (ticket.kind === 'global' && avoided?.(candidate))) continue
+            granted = this.claimSeat(ticket.seatKey, candidate, 'queued')
+            if (granted) break
+          }
         }
         if (!granted) return false
         ticket.granted = granted

@@ -44,9 +44,8 @@ function headroomOf(vm: Vm): number | null {
 }
 
 /**
- * 按草稿策略复现 rankSeatCandidates 的顺序：调度等级降序 → 占用比例
- * （平衡升序 / 填充降序）→ 余量降序 → id。并发、RPM 和预算闸不在这里判，
- * 所以只是预估。
+ * 周额度策略先按服务端分数排，再按调度等级、占用比例和余量打破平局。
+ * 实际分配还受主机状态、并发、RPM 和预算闸影响。
  */
 export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
   const fill = strategy === 'fill'
@@ -71,6 +70,11 @@ export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
   const open = rows
     .filter((row) => row.why == null)
     .sort((a, b) => {
+      if (strategy === 'weekly_pace') {
+        const score =
+          (b.vm.weekly_pace_score ?? -1) - (a.vm.weekly_pace_score ?? -1)
+        if (score) return score
+      }
       const priority =
         (Number(b.vm.schedule_level) || 0) - (Number(a.vm.schedule_level) || 0)
       if (priority) return priority
