@@ -174,6 +174,7 @@ import { requestKernelReloadWhenIdle, stopAllRustKernels } from './lib/transport
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
+import { createPublicStatusPage } from './lib/http/public-status.mjs'
 import { createGracefulShutdown } from './lib/http/graceful-shutdown.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
@@ -1676,6 +1677,13 @@ const gracefulShutdown = createGracefulShutdown({
   },
 })
 
+const publicStatusPage = createPublicStatusPage({
+  getSlots: (clusterNodes) =>
+    panel.buildPublicSlotViews({ cfg, accountQuota, routingConfig, poolScheduler, proxyPool, clusterNodes }),
+  getNodes: () => clusterManager.list(),
+  getDb,
+})
+
 const server = http.createServer(async (req, res) => {
   try {
     res.req = req
@@ -1731,6 +1739,8 @@ const server = http.createServer(async (req, res) => {
       })
     }
     gracefulShutdown.trackRequest(req, res)
+
+    if (p === '/check' || p === '/check/') return publicStatusPage(req, res)
 
     if (isTelemetryPath(p)) {
       return json(res, 200, telemetryInterceptResponse(p))

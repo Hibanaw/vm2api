@@ -75,6 +75,7 @@ jobs:
             patch_head=dcc16034c9f1d72774835223892da4316e39ff2c
           fi
           backend=(
+            src/server.mjs
             src/lib/pool/credential-weight.mjs
             src/lib/pool/pool-scheduler.mjs
             src/lib/admin/panel-api.mjs
@@ -84,6 +85,8 @@ jobs:
           git -C fork merge-base --is-ancestor "$baseline" "$patch_head"
           git -C fork -c core.abbrev=12 diff --binary -U1 "$baseline" "$patch_head" -- \
             "${backend[@]}" \
+            src/lib/http/public-status.mjs \
+            web/public/check.css \
             web/src/features/vm/usage-windows.tsx \
             web/src/features/vm/vm-list-table.tsx \
             web/src/features/vm/vm-rack-model.ts \
@@ -98,7 +101,8 @@ jobs:
             web/src/components/layout/app-title.tsx \
             test/unit/credential-weight.test.mjs \
             test/unit/pool-scheduler.test.mjs \
-            test/unit/release.test.mjs > "$RUNNER_TEMP/quota.patch"
+            test/unit/release.test.mjs \
+            test/unit/public-status.test.mjs > "$RUNNER_TEMP/quota.patch"
           test -s "$RUNNER_TEMP/quota.patch"
           test "v$(tr -d '[:space:]' < upstream/VERSION)" = "$UPSTREAM_TAG"
           mkdir -p image
@@ -112,6 +116,9 @@ jobs:
           for file in "${backend[@]}"; do
             install -Dm644 "upstream/$file" "image/$file"
           done
+          if [[ -f upstream/src/lib/http/public-status.mjs ]]; then
+            install -Dm644 upstream/src/lib/http/public-status.mjs image/src/lib/http/public-status.mjs
+          fi
           cp fork/deploy/Dockerfile.quota image/Dockerfile
       - uses: actions/setup-node@v7
         with:
@@ -121,6 +128,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           node --test test/unit/credential-weight.test.mjs test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs test/unit/release.test.mjs
+          if [[ -f test/unit/public-status.test.mjs ]]; then node --test test/unit/public-status.test.mjs; fi
           sh -n scripts/panel-upgrade.sh
           bash -n "$GITHUB_WORKSPACE/fork/deploy/upgrade-quota.sh"
       - name: Build console
