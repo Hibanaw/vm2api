@@ -22,12 +22,15 @@ import {
   zoneOf,
   type WindowReadout,
 } from '@/features/vm/vm-rack-model'
+import { windowTargetLabel, windowTiming } from '@/features/vm/window-timing'
 
 function MiniColumn({ w, now }: { w: WindowReadout; now: number }) {
   const reset = w.reset ? resetCountdown(w.reset, now) : null
+  const { targetPct } = windowTiming(w, now)
   const tip = [
     `${w.label} ${w.pct == null ? w.note || '未探测' : `${Math.round(w.pct)}%`}`,
     reset && `${reset} 后重置`,
+    windowTargetLabel(targetPct),
   ]
     .filter(Boolean)
     .join(' · ')
@@ -53,6 +56,15 @@ function MiniColumn({ w, now }: { w: WindowReadout; now: number }) {
             }}
           />
         )}
+        {targetPct != null ? (
+          <b
+            aria-hidden
+            className='absolute inset-x-0 h-0.5 rounded-full bg-foreground/70'
+            style={{
+              bottom: `clamp(0px, calc(${targetPct}% - 1px), calc(100% - 2px))`,
+            }}
+          />
+        ) : null}
       </span>
       <span className='text-[9.5px] text-[color:var(--text-tertiary)]'>
         {w.key === 'fable' ? 'F' : w.label}

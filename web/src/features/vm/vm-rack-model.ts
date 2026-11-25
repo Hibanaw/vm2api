@@ -137,6 +137,7 @@ export type WindowReadout = {
   note: string | null
   reset: unknown
   windowMinutes?: number | null
+  limitPct?: number
 }
 
 function clampCodexPercent(value: unknown): number | null {
@@ -158,6 +159,18 @@ function hasCustomCodexWindows(vm: Vm): boolean {
 
 /** 5H → 7D → Fable；Codex 若含非 5h/7d 实际周期（如 24h）则按实际窗口展示；Gemini API Key 无订阅窗口。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
+  const policy = vm.quota_policy ?? vm.openai_quota_policy
+  const limits = { '5h': policy?.limit_5h, '7d': policy?.limit_7d }
+  const quotaLimit = (key: string) => {
+    if (!vm.has_token || (key !== '5h' && key !== '7d')) return {}
+    const limit = limits[key]
+    return {
+      limitPct:
+        limit != null && Number.isFinite(limit)
+          ? Math.max(0, Math.min(1, limit)) * 100
+          : 100,
+    }
+  }
   if (vm.gemini) {
     if (vm.gemini.auth_method === 'api_key') return []
     const probed = (w: '5h' | '7d') =>
@@ -169,6 +182,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
         pct: probed('5h'),
         note: null,
         reset: vm.reset_5h,
+        ...quotaLimit('5h'),
       },
       {
         key: '7d',
@@ -176,6 +190,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
         pct: probed('7d'),
         note: null,
         reset: vm.reset_7d,
+        ...quotaLimit('7d'),
       },
     ]
   }
@@ -192,6 +207,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
           w.reset_at ??
           (id === '5h' ? vm.reset_5h : id === '7d' ? vm.reset_7d : null),
         windowMinutes: w.window_minutes ?? null,
+        ...quotaLimit(id),
       }
     })
   }
@@ -204,6 +220,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
       pct: probed('5h'),
       note: null,
       reset: vm.reset_5h,
+      ...quotaLimit('5h'),
     },
     {
       key: '7d',
@@ -211,6 +228,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
       pct: probed('7d'),
       note: null,
       reset: vm.reset_7d,
+      ...quotaLimit('7d'),
     },
   ]
   const fable = fableRow(vm)

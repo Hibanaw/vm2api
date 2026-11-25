@@ -81,6 +81,13 @@ jobs:
           git -C fork merge-base --is-ancestor "$baseline" "$patch_head"
           git -C fork -c core.abbrev=12 diff --binary -U1 "$baseline" "$patch_head" -- \
             "${backend[@]}" \
+            web/src/features/vm/usage-windows.tsx \
+            web/src/features/vm/vm-list-table.tsx \
+            web/src/features/vm/vm-rack-model.ts \
+            web/src/features/vm/vm-rack-unit.tsx \
+            web/src/features/vm/vm-row-detail.tsx \
+            web/src/features/vm/window-timing.ts \
+            web/src/features/vm/vm-rack-model.test.ts \
             web/src/features/settings/pool-pane.tsx \
             web/src/features/settings/pool-live-panel.tsx \
             web/src/types/panel-vm.ts \

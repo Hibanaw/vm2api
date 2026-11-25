@@ -61,7 +61,8 @@ import {
   SchedulableSwitch,
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
-import { riskFg, RISK_SOLID, riskLevel } from '@/features/vm/usage-meter'
+import { riskFg } from '@/features/vm/usage-meter'
+import { WindowBar } from '@/features/vm/usage-windows'
 import { PlatformMark } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
@@ -318,18 +319,17 @@ function QuotaCell({
         {w.note}
       </span>
     )
+  const t = windowTiming(w, now)
   if (w.pct == null)
     return (
       <div className='grid w-full grid-cols-[auto_1fr] gap-y-1 font-mono'>
         <span className={TERT}>—</span>
         <span className={cn('text-right text-[11px]', TERT)}>未探测</span>
-        <span
-          className='col-span-2 h-1 rounded-full bg-[repeating-linear-gradient(135deg,var(--muted)_0_3px,transparent_3px_6px)]'
-          aria-hidden
-        />
+        <div className='col-span-2'>
+          <WindowBar w={w} timing={t} />
+        </div>
       </div>
     )
-  const t = windowTiming(w, now)
   const full = w.pct >= 100
   const hot = w.pct >= 90
   const left = vm.has_token ? resetCountdown(w.reset, now) : null
@@ -338,7 +338,7 @@ function QuotaCell({
     <div
       className='grid w-full grid-cols-[auto_1fr] items-baseline gap-y-1 font-mono tabular-nums'
       title={`${w.label} 用量 ${w.pct.toFixed(0)}%${
-        t.elapsedPct != null
+        t.elapsedPct != null && t.startMs != null
           ? ` · 时间已过 ${t.elapsedPct.toFixed(0)}% · ${fmtResetClock(w.reset)} 重置`
           : ''
       }`}
@@ -361,22 +361,9 @@ function QuotaCell({
       >
         {eta}
       </span>
-      <span className='relative col-span-2 h-1 rounded-full bg-muted'>
-        <i
-          className='absolute inset-y-0 left-0 rounded-full'
-          style={{
-            width: `${Math.min(100, w.pct)}%`,
-            backgroundColor: RISK_SOLID[riskLevel(w.pct)],
-          }}
-        />
-        {t.elapsedPct != null ? (
-          <b
-            aria-hidden
-            className='absolute -top-[3px] -bottom-[3px] w-0.5 rounded-[1px] bg-foreground'
-            style={{ left: `calc(${t.elapsedPct}% - 1px)` }}
-          />
-        ) : null}
-      </span>
+      <div className='col-span-2'>
+        <WindowBar w={w} timing={t} />
+      </div>
     </div>
   )
 }

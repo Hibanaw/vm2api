@@ -27,7 +27,11 @@ import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
 import { vmWindows, type WindowReadout } from '@/features/vm/vm-rack-model'
-import { windowTiming, type WindowTiming } from '@/features/vm/window-timing'
+import {
+  windowTargetLabel,
+  windowTiming,
+  type WindowTiming,
+} from '@/features/vm/window-timing'
 
 /**
  * 请求 / 用量窗口 / 成本三块共用的行高。列表里三列并排时，
@@ -72,14 +76,7 @@ function WindowRow({
         </span>
       ) : (
         <>
-          {pct == null ? (
-            <div
-              className='h-[5px] w-full rounded-full track-recessed'
-              aria-hidden='true'
-            />
-          ) : (
-            <UsageMeter value={pct} size='sm' ticks={false} />
-          )}
+          <WindowBar w={w} timing={windowTiming(w, now)} />
           <span
             className={cn(
               'text-right font-mono text-xs font-medium tabular-nums',
@@ -385,7 +382,7 @@ function TimeTick({ pct }: { pct: number | null }) {
     <span
       aria-hidden
       className='pointer-events-none absolute -top-0.5 -bottom-0.5 w-0.5 rounded-full bg-foreground/55'
-      style={{ left: `calc(${pct}% - 1px)` }}
+      style={{ left: `clamp(0px, calc(${pct}% - 1px), calc(100% - 2px))` }}
     />
   )
 }
@@ -401,7 +398,7 @@ export function WindowBar({
   size?: 'sm' | 'md'
 }) {
   return (
-    <div className='relative'>
+    <div className='relative' title={windowTargetLabel(timing.targetPct)}>
       {w.pct == null ? (
         <div
           className={cn(
@@ -413,7 +410,7 @@ export function WindowBar({
       ) : (
         <UsageMeter value={w.pct} size={size} ticks={false} />
       )}
-      <TimeTick pct={timing.elapsedPct} />
+      <TimeTick pct={timing.targetPct} />
     </div>
   )
 }

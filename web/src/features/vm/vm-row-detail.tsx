@@ -227,7 +227,7 @@ function WindowsCard({ vm, now }: { vm: Vm; now: number }) {
         <span className={CARD_NOTE}>
           {vm.gemini?.auth_method === 'api_key'
             ? 'API Key 按量计费'
-            : '竖线 = 时间进度 · 节奏 = 用量% ÷ 时间%'}
+            : '竖线 = 均摊目标 · 节奏 = 实际用量 ÷ 均摊目标'}
         </span>
       </div>
       {vm.gemini?.auth_method === 'api_key' ? (

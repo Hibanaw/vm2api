@@ -8,9 +8,11 @@ const WINDOW_SPAN_MS: Record<string, number> = {
 }
 
 export type WindowTiming = {
-  /** 窗口时间已过去的百分比（0–100）；无重置时间为 null */
+  /** 窗口已过去的百分比；未开窗的 5H/7D 为 0。 */
   elapsedPct: number | null
-  /** 用量% ÷ 时间%；>1 说明用得比时间快 */
+  /** 均摊到当前时刻的用量，使用进度条的官方额度百分比坐标。 */
+  targetPct: number | null
+  /** 实际用量 ÷ 当前目标用量；>1 说明用得比时间快 */
   pace: number | null
   /** 按当前节奏重置前就会用满时，还需多少毫秒 */
   fullInMs: number | null
@@ -26,8 +28,10 @@ export function windowTiming(w: WindowReadout, now: number): WindowTiming {
       : WINDOW_SPAN_MS[w.key]
   const resetMs = expiresAtToMs(w.reset) || null
   if (!span || !resetMs || resetMs <= now) {
+    const unopenedPct = span && w.limitPct != null ? 0 : null
     return {
-      elapsedPct: null,
+      elapsedPct: unopenedPct,
+      targetPct: unopenedPct,
       pace: null,
       fullInMs: null,
       startMs: null,
@@ -37,12 +41,20 @@ export function windowTiming(w: WindowReadout, now: number): WindowTiming {
   const startMs = resetMs - span
   const elapsed = Math.min(span, Math.max(0, now - startMs))
   const elapsedPct = (elapsed / span) * 100
+  const limit = w.limitPct ?? 100
+  const targetPct = (elapsed / span) * limit
   const pct = w.pct
-  const pace = pct != null && elapsedPct > 0 ? pct / elapsedPct : null
+  const pace = pct != null && targetPct > 0 ? pct / targetPct : null
   let fullInMs: number | null = null
-  if (pct != null && pct > 0 && pct < 100 && elapsed > 0) {
-    const need = ((100 - pct) / pct) * elapsed
+  if (pct != null && pct > 0 && pct < limit && elapsed > 0) {
+    const need = ((limit - pct) / pct) * elapsed
     if (need < resetMs - now) fullInMs = need
   }
-  return { elapsedPct, pace, fullInMs, startMs, resetMs }
+  return { elapsedPct, targetPct, pace, fullInMs, startMs, resetMs }
+}
+
+export function windowTargetLabel(targetPct: number | null) {
+  return targetPct == null
+    ? undefined
+    : `按时间均摊应使用 ${Number(targetPct.toFixed(1))}%`
 }

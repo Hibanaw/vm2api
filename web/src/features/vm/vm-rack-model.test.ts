@@ -247,6 +247,52 @@ describe('bladeState', () => {
   })
 })
 
+describe('quota pace markers', () => {
+  const now = Date.parse('2026-11-25T12:00:00Z')
+  const hour = 3600_000
+  const quota = {
+    limit_5h: 0.8,
+    limit_7d: 0.6,
+    block_on_5h: true,
+    block_on_7d: true,
+    weekly_split: false,
+  }
+
+  it('scales the halfway marker by each effective slot cap', () => {
+    const [short, long] = vmWindows(
+      vm({
+        quota_policy: quota,
+        reset_5h: new Date(now + 2.5 * hour).toISOString(),
+        reset_7d: new Date(now + 84 * hour).toISOString(),
+      })
+    )
+    expect(windowTiming(short, now)).toMatchObject({
+      elapsedPct: 50,
+      targetPct: 40,
+      pace: 0.5,
+    })
+    expect(windowTiming(long, now).targetPct).toBe(30)
+  })
+
+  it('keeps the marker at zero until a new reset is reported', () => {
+    const [short, long] = vmWindows(
+      vm({
+        reset_5h: new Date(now - hour).toISOString(),
+        utilization_7d: null,
+      })
+    )
+    for (const window of [short, long]) {
+      expect(windowTiming(window, now)).toMatchObject({
+        elapsedPct: 0,
+        targetPct: 0,
+        startMs: null,
+        pace: null,
+      })
+    }
+    expect(long.pct).toBeNull()
+  })
+})
+
 describe('Codex custom 24h window (#1744)', () => {
   it('renders 24H window as live with 24h timing instead of 5H/7D', () => {
     const now = Date.parse('2026-11-24T12:00:00Z')
