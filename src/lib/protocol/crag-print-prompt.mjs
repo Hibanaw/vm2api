@@ -9,8 +9,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
 import { materializeAutomaticCache } from './cache-ttl.mjs'
+import { isOnlyOfficialCliIdentitySystem, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -314,6 +316,16 @@ function hasOutputConfig(message) {
   return message?.output_config != null && typeof message.output_config === 'object'
 }
 
+function mergeFoldedOutputConfig(base, next) {
+  if (!next || typeof next !== 'object') return base
+  const merged = { ...(base || {}), ...next }
+  if (Object.prototype.hasOwnProperty.call(next, 'effort') && isEmptyEffortValue(next.effort)) {
+    if (base && Object.prototype.hasOwnProperty.call(base, 'effort')) merged.effort = base.effort
+    else delete merged.effort
+  }
+  return Object.keys(merged).length ? merged : base
+}
+
 /** Media has no reminder form, and `clear_at` acts where it stands. */
 function foldable(message) {
   if (message?.clear_at != null) return false
@@ -366,7 +378,7 @@ function foldSystemTurns(messages) {
             ...previous,
             content: [...contentBlocks(previous.content), ...blocks],
           }
-        if (hasOutputConfig(message)) outputConfig = { ...outputConfig, ...message.output_config }
+        if (hasOutputConfig(message)) outputConfig = mergeFoldedOutputConfig(outputConfig, message.output_config)
       } else {
         pending = pending.concat(blocks)
         pendingSource.push(message)
@@ -381,7 +393,7 @@ function foldSystemTurns(messages) {
           content: prependAfterToolResults(content, pending),
         })
         for (const source of pendingSource)
-          if (hasOutputConfig(source)) outputConfig = { ...outputConfig, ...source.output_config }
+          if (hasOutputConfig(source)) outputConfig = mergeFoldedOutputConfig(outputConfig, source.output_config)
         pending = []
         pendingSource = []
       } else {
@@ -440,6 +452,11 @@ export function prepareCragPrintBody(
   // cache_control. Convert it here, before any early return, so every path out
   // of this function hands the kernel the standard shape.
   const out = materializeAutomaticCache({ ...(body || {}) })
+  if (out.safeguards !== undefined) {
+    const sg = sanitizeSafeguardsForCrag(out.safeguards, capabilities)
+    if (sg.value === undefined) delete out.safeguards
+    else out.safeguards = sg.value
+  }
   const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
   if (nativeV3 && Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
@@ -496,7 +513,8 @@ export function prepareCragPrintBody(
       },
     })
   }
-  const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
+  const skipRelocatedPlaceholder = !officialPassthrough && isOnlyOfficialCliIdentitySystem(body?.system)
+  const tail = officialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(body?.system)
   if (!tail) return out
   if (textCache && mode === 'append') {
     out.system = body.system

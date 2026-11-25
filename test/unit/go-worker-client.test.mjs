@@ -8,6 +8,7 @@ import {
   callGoWorker,
   finalizeWorkerPayload,
   streamGoWorker,
+  workerEnvelope,
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
@@ -2220,6 +2221,55 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
   }
 })
 
+test('workerEnvelope falls back to body.crag_options.cache_ttl before routing default', async () => {
+  const exec = {
+    vmId: 'vm-crag',
+    vm: { id: 'vm-crag', dataplane: 'crag', crag_kernel_version: 'v2' },
+    workerStatus: {
+      runtime_variant: 'crag-v2',
+      capabilities: ['generation_controls_v3', 'linux_tui_native_queue'],
+    },
+  }
+  const routing = { compatibility: { cache_ttl: '1h' } }
+  const baseBody = {
+    model: 'claude-opus-4-6',
+    max_tokens: 128,
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+
+  const fromOptions = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, crag_options: { cache_ttl: '5m' } },
+  })
+  assert.equal(fromOptions.envelope.cache_ttl, '5m')
+  assert.equal(fromOptions.envelope.body.cache_ttl, undefined)
+  assert.equal(fromOptions.envelope.body.crag_options?.cache_ttl, '5m')
+
+  const fromBody = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, cache_ttl: '5m', crag_options: { cache_ttl: '1h' } },
+  })
+  assert.equal(fromBody.envelope.cache_ttl, '5m')
+
+  const fromRouting = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: baseBody,
+  })
+  assert.equal(fromRouting.envelope.cache_ttl, '1h')
+})
+
 unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
   const details = {
     type: 'refusal',
@@ -2254,6 +2304,145 @@ unixTest('streamGoWorker preserves refusal details when an empty response become
     assert.deepEqual(result.stopDetails, details)
     assert.equal(result.body.error.code, 'empty_response')
     assert.deepEqual(lines, [])
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('streamGoWorker and callGoWorker do not post cancel after terminal message delivery', async () => {
+  const cancels = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (req.url === '/internal/v1/cancel') {
+      cancels.push(payload.request_id)
+      res.setHeader('content-type', 'application/json')
+      res.end('{"ok":true,"cancelled":true}')
+      return
+    }
+    if (payload.stream === false) {
+      res.setHeader('content-type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'msg_json_tool',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-5',
+          content: [{ type: 'tool_use', id: 'toolu_json', name: 'lookup', input: { k: 'v' } }],
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
+        }),
+      )
+      return
+    }
+    res.setHeader('content-type', 'text/event-stream')
+    if (payload.gateway_policy?.native_handoff_v1) {
+      res.write(
+        `event: kin_provider_result\ndata: ${JSON.stringify({
+          type: 'kin_provider_result',
+          schema_version: 2,
+          run_id: 'run-1',
+          turn_id: 1,
+          attempt_id: 1,
+          message_id: 'msg_native_tool',
+          model: 'claude-sonnet-5',
+          http_status: 200,
+          provider_complete: true,
+          usage_complete: true,
+          handoff_complete: true,
+          response_valid: true,
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
+        })}\n\n`,
+      )
+      writeData(res, {
+        type: 'message_start',
+        message: { id: 'msg_native_tool', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+      })
+      writeData(res, {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_native', name: 'lookup', input: {} },
+      })
+      writeData(res, {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"k":"v"}' },
+      })
+      writeData(res, { type: 'content_block_stop', index: 0 })
+      writeData(res, {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use', stop_sequence: null },
+        usage: { output_tokens: 3 },
+      })
+      writeData(res, { type: 'message_stop' })
+      res.end()
+      return
+    }
+    writeData(res, {
+      type: 'message_start',
+      message: { id: 'msg_sse_tool', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+    })
+    writeData(res, {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_sse', name: 'lookup', input: {} },
+    })
+    writeData(res, {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"k":"v"}' },
+    })
+    writeData(res, { type: 'content_block_stop', index: 0 })
+    writeData(res, {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use', stop_sequence: null },
+      usage: { output_tokens: 3 },
+    })
+    writeData(res, { type: 'message_stop' })
+    res.end()
+  })
+  try {
+    for (const nativeHandoff of [false, true]) {
+      const controller = new AbortController()
+      const exec = nativeHandoff
+        ? {
+            ...fx.exec,
+            vm: {
+              ...fx.exec.vm,
+              runtime: {
+                ...fx.exec.vm?.runtime,
+                capabilities: ['native_handoff_v1', 'provider_result_v2'],
+              },
+            },
+          }
+        : fx.exec
+      const result = await streamGoWorker({
+        exec,
+        managedCrag: nativeHandoff,
+        body: { model: 'claude-sonnet-5', stream: true, messages: [{ role: 'user', content: 'use lookup' }] },
+        signal: controller.signal,
+        onEvent: (line) => {
+          if (String(line).includes('"message_stop"')) controller.abort()
+        },
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.body.stop_reason, 'tool_use')
+    }
+    const jsonController = new AbortController()
+    const jsonResult = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', stream: false, messages: [{ role: 'user', content: 'use lookup' }] },
+      signal: jsonController.signal,
+    })
+    jsonController.abort()
+    assert.equal(jsonResult.ok, true)
+    assert.equal(jsonResult.body.stop_reason, 'tool_use')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.deepEqual(cancels, [])
   } finally {
     await fx.close()
   }

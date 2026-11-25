@@ -1,4 +1,4 @@
-import { normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { canRepairAdaptiveThinking, normalizeThinkingForModel } from '../protocol/thinking.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
 import {
   assistantStopReason,
@@ -236,6 +236,14 @@ export function isUnconfirmedAuthFailure(result = {}) {
 }
 
 const TIMEOUT_PATTERNS = /timeout|deadline|response header|timed out/i
+const PROXY_PATTERNS =
+  /proxy|socks|dial|dns|tls|connect|splice_rst|reset by peer|econnrefused|ehostunreach|enetunreach/i
+const PRE_FIRST_FRAME_TRANSPORT_CODES = new Set([
+  'upstream_network_error',
+  'transport_error',
+  'upstream_transport_error',
+  'upstream_transport',
+])
 
 function isTimeoutFailure(workerCode, message) {
   return TIMEOUT_PATTERNS.test(`${workerCode} ${message}`)
@@ -244,7 +252,46 @@ function isTimeoutFailure(workerCode, message) {
 function isProxyFailure(workerCode, message) {
   const hay = `${workerCode} ${message}`
   if (isTimeoutFailure(workerCode, message)) return false
-  return /proxy|socks|dial|dns|tls|connect/i.test(hay)
+  return PROXY_PATTERNS.test(hay)
+}
+
+function proxyTransportFailure(now) {
+  return {
+    scope: 'proxy',
+    action: 'continue-and-cooldown',
+    reason: 'proxy_transport_failure',
+    cooldownUntil: now + 60_000,
+    retrySameAccount: false,
+  }
+}
+
+/** Pre-first-frame non-timeout transport/proxy failure (before downstream commit or any upstream event). */
+export function isPreFirstFrameTransportFailure(
+  result,
+  workerCode = resultErrorCode(result),
+  message = bodyMessage(result?.body),
+) {
+  if (result?.committed || result?.firstByteAt != null || result?.cragPolicyBlock === true) return false
+  const facts = result?.providerResult
+  if (facts?.observation?.policy_blocked === true) return false
+  const combinedMessage = `${message || ''} ${facts?.error?.message || ''}`.trim()
+  if (isTimeoutFailure(workerCode, combinedMessage)) return false
+  if (isNativeProcessExit(workerCode, combinedMessage) || facts?.error?.type === 'process_error') return false
+  if (
+    [
+      workerCode,
+      facts?.error?.type,
+      facts?.error?.code,
+      result?.body?.error?.type,
+      result?.body?.error?.code,
+      facts?.observation?.kind,
+      result?.observation?.kind,
+    ].some((value) => PRE_FIRST_FRAME_TRANSPORT_CODES.has(String(value || '')))
+  ) {
+    return true
+  }
+  if (isProxyFailure(workerCode, combinedMessage)) return true
+  return facts?.schema_version === 2 && facts.provider_complete === false && facts.http_status == null
 }
 
 function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}) {
@@ -344,6 +391,7 @@ function classifyUpstreamResultRaw(
   result = {},
   {
     model = null,
+    requestBody = null,
     now = Date.now(),
     repaired = false,
     hasRefresh = null,
@@ -492,6 +540,7 @@ function classifyUpstreamResultRaw(
       cooldownUntil: null,
       retrySameAccount: false,
       pauseSchedule: true,
+      ...(status === 400 || status === 403 ? { circuit: true } : {}),
       detail: { status, message: message.slice(0, 500) },
     }
   }
@@ -524,6 +573,7 @@ function classifyUpstreamResultRaw(
       reason: 'credential_refresh_failed',
       cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
       retrySameAccount: false,
+      circuit: true,
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
@@ -548,14 +598,7 @@ function classifyUpstreamResultRaw(
   }
   // Kernel / cli-node named the cause; none of these is the account's fault.
   if (workerCode === ErrorCode.UPSTREAM_NETWORK) {
-    if (isProxyFailure('', message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
-    }
+    if (isProxyFailure('', message)) return proxyTransportFailure(now)
     return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: false })
   }
   if (workerCode === ErrorCode.UPSTREAM_STREAM_INTERRUPTED) {
@@ -576,22 +619,25 @@ function classifyUpstreamResultRaw(
     })
   }
   if (result.transportError || status === 0) {
-    if (isProxyFailure(workerCode, message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
-    }
+    if (isProxyFailure(workerCode, message)) return proxyTransportFailure(now)
     return continueWithoutCooldown({
       scope: 'worker',
       reason: isTimeoutFailure(workerCode, message) ? 'worker_timeout' : 'worker_transport_failure',
     })
   }
   if (status === 400) {
-    if (code === 'invalid_kernel_request') {
-      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    if (code === 'invalid_kernel_request' || code === 'unsupported_capability' || code === 'thinking_incompatible') {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason:
+          code === 'thinking_incompatible'
+            ? 'thinking_incompatible'
+            : code === 'unsupported_capability'
+              ? 'unsupported_capability'
+              : 'invalid_request',
+        cooldownUntil: null,
+      }
     }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
@@ -647,6 +693,14 @@ function classifyUpstreamResultRaw(
       }
     }
     if (!repaired && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
+      if (requestBody && !canRepairAdaptiveThinking(requestBody, model)) {
+        return {
+          scope: 'request',
+          action: 'stop',
+          reason: 'thinking_incompatible',
+          cooldownUntil: null,
+        }
+      }
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -654,7 +708,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null, circuit: true }
   }
   if (status === 401) return classifyOAuth401(hasRefresh, hay)
   if (status === 403) {
@@ -664,6 +718,7 @@ function classifyUpstreamResultRaw(
         action: 'continue-and-cooldown',
         reason: 'proxy_or_edge_forbidden',
         cooldownUntil: now + 60_000,
+        circuit: true,
       }
     }
     if (isFableModel(model)) {
@@ -674,6 +729,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
         retrySameAccount: false,
         mark_tier: 'pro',
+        circuit: true,
       }
     }
     return {
@@ -681,6 +737,7 @@ function classifyUpstreamResultRaw(
       action: 'continue-and-cooldown',
       reason: 'permission_denied',
       cooldownUntil: now + clampOauth401CooldownMs(oauth401CooldownMs),
+      circuit: true,
     }
   }
   if (status === 429) {
@@ -762,9 +819,12 @@ function classifyUpstreamResultRaw(
     }
     return {
       scope: 'account',
-      action: reset > now ? 'continue-and-cooldown' : 'continue',
+      action: 'continue',
       reason: 'rate_limited_unknown',
-      cooldownUntil: reset > now ? reset : null,
+      // Retry-After says when to retry this request, not which models are
+      // exhausted. The usage probe resolves the window without parking
+      // unrelated models on the account.
+      cooldownUntil: null,
       retrySameAccount: false,
     }
   }
@@ -786,14 +846,29 @@ function classifyUpstreamResultRaw(
         retrySameAccount: false,
       })
     }
+    const providerMessage = String(result?.providerResult?.error?.message || '')
+    const combinedMessage = providerMessage ? `${message} ${providerMessage}`.trim() : message
+    const combinedHay = providerMessage
+      ? `${hay} ${result?.providerResult?.error?.type || ''} ${result?.providerResult?.error?.code || ''} ${providerMessage}`
+      : hay
     // The VM's native Claude process died before answering (cgroup OOM or pids
     // limit, crash). The account is fine: try another unit, open no circuit.
-    if (isNativeProcessExit(workerCode, hay)) {
+    if (isNativeProcessExit(workerCode, combinedHay) || result?.providerResult?.error?.type === 'process_error') {
       return continueWithoutCooldown({
         scope: 'worker',
         reason: 'worker_process_exit',
         retrySameAccount: false,
       })
+    }
+    const preFirstFrame = !result.committed && result.firstByteAt == null
+    // #1562: Pre-first-frame 502 timeout naming SOCKS/proxy is egress dial failure, not provider_timeout.
+    if (
+      status === 502 &&
+      preFirstFrame &&
+      isTimeoutFailure(workerCode, combinedMessage) &&
+      /socks|proxy/i.test(combinedHay)
+    ) {
+      return proxyTransportFailure(now)
     }
     if (isFableModel(model) && (status === 408 || status === 504 || /timeout/i.test(message))) {
       return {
@@ -804,15 +879,26 @@ function classifyUpstreamResultRaw(
         cooldownUntil: now + 30_000,
       }
     }
-    if (status === 408 || isTimeoutFailure(workerCode, message)) {
+    if (status === 408 || isTimeoutFailure(workerCode, combinedMessage)) {
       return continueWithoutCooldown({
         scope: 'provider',
         reason: 'provider_timeout',
       })
     }
+    // #1562: Pre-first-frame 502 transport failure cools proxy on proxy markers, else switches unit via circuit.
+    if (status === 502 && isPreFirstFrameTransportFailure(result, workerCode, message)) {
+      if (isProxyFailure(workerCode, combinedMessage)) return proxyTransportFailure(now)
+      return {
+        scope: 'worker',
+        action: 'continue',
+        reason: 'upstream_network_error',
+        cooldownUntil: null,
+        retrySameAccount: false,
+        circuit: true,
+      }
+    }
 
-    // A 2xx stream that died before visible output used to be rewritten to 502.
-    // Kernel may also send that 502 with terminal incomplete. Neither is overload.
+    // Remaining uncommitted incomplete 502 (post-first-frame stream drop or generic incomplete hop, not overload).
     if (result.terminalState === 'incomplete' && !result.committed && !/overload/i.test(message)) {
       return continueWithoutCooldown({
         scope: 'stream',

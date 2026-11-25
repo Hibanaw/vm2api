@@ -32,9 +32,11 @@ const CODE_MAP = {
   vm_pool_unavailable: 'request',
   api_key_model_not_allowed: 'request',
   claude_code_only: 'request',
+  client_blocked: 'request',
   third_party_client: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
+  image_too_large: 'request',
   empty_body: 'request',
   missing_field: 'request',
   invalid_field: 'request',
@@ -80,6 +82,7 @@ const CODE_MAP = {
   request_cancelled: 'timeout',
   client_aborted: 'timeout',
   selection_cancelled: 'timeout',
+  gemini_inference_cancelled: 'timeout',
   ECONNRESET: 'timeout',
   aborted: 'timeout',
   upstream_auth_error: 'credential',
@@ -99,6 +102,7 @@ export const IGNORED_ERROR_CODES = new Set([
   'request_cancelled',
   'client_aborted',
   'selection_cancelled',
+  'gemini_inference_cancelled',
 ])
 
 /**
@@ -136,6 +140,7 @@ export const SLA_OK_ERROR_CODES = new Set([
   'vm_pool_unavailable',
   'api_key_model_not_allowed',
   'claude_code_only',
+  'client_blocked',
   'third_party_client',
   // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
   'pool_overloaded',

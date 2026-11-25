@@ -24,6 +24,7 @@ import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
@@ -45,6 +46,8 @@ import {
   normalizeInferenceWebsocket,
   validateInferenceWebsocketPatch,
 } from '../protocol/codex-route.mjs'
+import { mergeGeminiRouting, normalizeGeminiRouting, validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
+import { callGeminiHost } from '../gemini/routes.mjs'
 import {
   validateOpenAIQuotaPatch,
   mergeOpenAIQuotaPolicy,
@@ -61,7 +64,11 @@ import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
-import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  telemetryUploadInterval,
+} from '../vm/native-telemetry.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -372,6 +379,7 @@ export function createRoutingRuntime(ctx) {
       ...prev,
       ...next,
       real: { ...(prev.real || {}), ...(next.real || {}) },
+      gemini: { ...(prev.gemini || {}), ...(next.gemini || {}) },
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)
@@ -444,7 +452,7 @@ export function createRoutingRuntime(ctx) {
   // Native slots hot-read kernel.json; publication must be acknowledged per VM.
   async function syncTelemetryUploadInterval(
     routingConfig,
-    { defaultEnabled = false, prevDefaultEnabled = false } = {},
+    { defaultEnabled = false, prevDefaultEnabled = false, disableNonessentialChanged = false } = {},
   ) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
@@ -459,7 +467,7 @@ export function createRoutingRuntime(ctx) {
         fresh.updated_at = new Date().toISOString()
         atomicWriteJson(vmPath, fresh, { mode: 0o600 })
       }
-      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn) {
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn && !disableNonessentialChanged) {
         applied.skipped += 1
         continue
       }
@@ -492,6 +500,7 @@ export function createRoutingRuntime(ctx) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    validateGeminiRoutingPatch(body)
     let nextRedaction = null
     if (body.redaction !== undefined) {
       nextRedaction = normalizeRedaction(body.redaction)
@@ -509,12 +518,19 @@ export function createRoutingRuntime(ctx) {
     const prevRequestBytes = maxRequestBytes(routingConfig)
     const prevUploadInterval = telemetryUploadInterval(routingConfig)
     const prevDefaultEnabled = telemetryDefaultEnabled(routingConfig)
+    const prevDisableNonessential = telemetryDisableNonessentialTraffic(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
+    }
+    if (body.batch_group && typeof body.batch_group === 'object' && !Array.isArray(body.batch_group)) {
+      routingConfig.batch_group = mergeBatchGroupConfig({
+        ...(routingConfig.batch_group || {}),
+        ...body.batch_group,
+      })
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
     if (body.inference) {
@@ -548,6 +564,9 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
     }
+    if (body.gemini) {
+      routingConfig.gemini = mergeGeminiRouting(routingConfig.gemini, body.gemini)
+    }
     if (body.vm) {
       const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
       const next = { ...prev, ...body.vm }
@@ -563,6 +582,9 @@ export function createRoutingRuntime(ctx) {
       }
       if (Object.hasOwn(body.telemetry, 'default_enabled')) {
         nextTelemetry.default_enabled = body.telemetry.default_enabled === true
+      }
+      if (Object.hasOwn(body.telemetry, 'disable_nonessential_traffic')) {
+        nextTelemetry.disable_nonessential_traffic = body.telemetry.disable_nonessential_traffic === true
       }
       routingConfig.telemetry = nextTelemetry
     }
@@ -611,9 +633,17 @@ export function createRoutingRuntime(ctx) {
         ? reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly: !requestBytesChanged })
         : 0
     const defaultEnabled = telemetryDefaultEnabled(routingConfig)
+    const disableNonessential = telemetryDisableNonessentialTraffic(routingConfig)
+    const disableNonessentialChanged = disableNonessential !== prevDisableNonessential
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval || defaultEnabled !== prevDefaultEnabled
-        ? await syncTelemetryUploadInterval(routingConfig, { defaultEnabled, prevDefaultEnabled })
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval ||
+      defaultEnabled !== prevDefaultEnabled ||
+      disableNonessentialChanged
+        ? await syncTelemetryUploadInterval(routingConfig, {
+            defaultEnabled,
+            prevDefaultEnabled,
+            disableNonessentialChanged,
+          })
         : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
@@ -621,6 +651,23 @@ export function createRoutingRuntime(ctx) {
     if (body.pool) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
     const kernelReload = await reloadNeeded
+    let geminiSync = null
+    if (body.gemini) {
+      const hostCaller = ctx.callGeminiHost || callGeminiHost
+      try {
+        const res = await hostCaller('apply-policy', { policy: routingConfig.gemini })
+        geminiSync = {
+          ok: true,
+          shards_updated: Number(res?.shards_updated || 0),
+          shards_total: Number(res?.shards_total || 0),
+        }
+      } catch (error) {
+        geminiSync = {
+          ok: false,
+          code: error?.code || 'gemini_host_unavailable',
+        }
+      }
+    }
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
@@ -632,6 +679,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     } catch (err) {
       console.error(
@@ -646,6 +694,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     }
   }
@@ -666,9 +715,11 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.websocket = normalizeInferenceWebsocket(doc.websocket)
       doc.codex = normalizeCodexRouting(doc.codex)
+      doc.gemini = normalizeGeminiRouting(doc.gemini)
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.batch_group != null) doc.batch_group = mergeBatchGroupConfig(doc.batch_group)
       if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {

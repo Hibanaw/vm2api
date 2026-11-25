@@ -107,6 +107,15 @@ function summarizeTools(tools) {
       for (const member of members) visit(member)
       return
     }
+    const geminiDecls = Array.isArray(tool.functionDeclarations)
+      ? tool.functionDeclarations
+      : Array.isArray(tool.function_declarations)
+        ? tool.function_declarations
+        : null
+    if (geminiDecls) {
+      functions += geminiDecls.length
+      return
+    }
     if (type === 'function' || type === 'custom' || (!type && typeof tool.name === 'string')) functions += 1
   }
   for (const tool of tools) visit(tool)
@@ -119,28 +128,57 @@ function summarizeTools(tools) {
   return { count: tools.length, functions, bytes, deferred, search }
 }
 
+function systemInstructionLen(value) {
+  if (typeof value === 'string') return value.length
+  if (Array.isArray(value)) {
+    return value.reduce((n, b) => n + (typeof b === 'string' ? b.length : (b?.text || '').length), 0)
+  }
+  if (value && typeof value === 'object' && Array.isArray(value.parts)) {
+    return value.parts.reduce((n, p) => n + (typeof p?.text === 'string' ? p.text.length : 0), 0)
+  }
+  return 0
+}
+
 function summarizeBody(body) {
   if (!body || typeof body !== 'object') return { empty: true }
-  const messages = Array.isArray(body.messages) ? body.messages : null
+  const messages = Array.isArray(body.messages) ? body.messages : Array.isArray(body.contents) ? body.contents : null
   const roles = messages ? messages.map((m) => m?.role).filter(Boolean) : []
   const toolStats = summarizeTools(body.tools)
-  let systemLen = 0
-  if (typeof body.system === 'string') systemLen = body.system.length
-  else if (Array.isArray(body.system)) {
-    systemLen = body.system.reduce((n, b) => n + (typeof b === 'string' ? b.length : (b?.text || '').length), 0)
-  }
+  const gc = body.generationConfig ?? body.generation_config
+  const systemLen =
+    systemInstructionLen(body.system) ||
+    systemInstructionLen(body.systemInstruction ?? body.system_instruction) ||
+    systemInstructionLen(body.instructions)
+  const hasThinking =
+    body.thinking != null ||
+    body.reasoning != null ||
+    body.reasoning_effort != null ||
+    gc?.thinkingConfig != null ||
+    gc?.thinking_config != null
   return {
     model: body.model || null,
     stream: !!body.stream,
-    max_tokens: body.max_tokens ?? body.max_output_tokens ?? null,
-    messages_count: messages ? messages.length : body.input != null ? 1 : 0,
+    max_tokens:
+      body.max_tokens ??
+      body.max_output_tokens ??
+      body.max_completion_tokens ??
+      gc?.maxOutputTokens ??
+      gc?.max_output_tokens ??
+      null,
+    messages_count: messages
+      ? messages.length
+      : Array.isArray(body.input)
+        ? body.input.length
+        : body.input != null
+          ? 1
+          : 0,
     roles,
     tools_count: Array.isArray(body.tools) ? body.tools.length : 0,
     tool_functions_count: toolStats.functions,
     tools_bytes: toolStats.bytes,
     tools_deferred_count: toolStats.deferred,
     tools_search_declared: toolStats.search,
-    has_thinking: body.thinking != null,
+    has_thinking: hasThinking,
     system_len: systemLen,
     top_level_keys: Object.keys(body).sort(),
   }
@@ -244,7 +282,13 @@ function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase()
-    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie' || key === 'set-cookie') {
+    if (
+      key === 'authorization' ||
+      key === 'x-api-key' ||
+      key === 'x-goog-api-key' ||
+      key === 'cookie' ||
+      key === 'set-cookie'
+    ) {
       out[key] = '***REDACTED***'
     } else if (key === 'x-panel-token') {
       out[key] = '***REDACTED***'
@@ -494,7 +538,10 @@ export class RequestLogStore {
       mode,
       t0: Date.now(),
       protocol,
-      path: pathName || req.url || '',
+      // 兜底剥掉查询串：调用方都传 url.pathname，但 #1637 起 /v1beta/models 允许
+      // 用 ?key= 携带凭据，一旦有新调用点漏传 pathName，原始 req.url 会带着真 key
+      // 被 _appendJsonl 原样写进 request-logs（redactSecrets 只作用于 body）。
+      path: pathName || String(req.url || '').split('?', 1)[0],
       method: req.method || 'POST',
       ip: safeIp(req),
       user_agent: String(req.headers?.['user-agent'] || '').slice(0, 512),
@@ -675,6 +722,7 @@ export class RequestLogStore {
             ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
             : null,
         hop_meta: extra.hop_meta || null,
+        batch_member: extra.batch_member || null,
         via: extra.via || extra.hop_meta?.via || null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
@@ -836,7 +884,7 @@ export class RequestLogStore {
       max_mb: this.maxMb,
       muted_error_classes: this.mutedErrorClasses.slice(),
       recent_normal: this._mem.length,
-      backend: 'sqlite',
+      backend: this.db?.engine === 'postgres' ? 'postgres' : 'sqlite',
       jsonl_mirror: this.jsonlMirror,
       total_rows: (() => {
         try {

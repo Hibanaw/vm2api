@@ -466,10 +466,12 @@ test('only the CRAG seat outside the signed quota leaves the pool, including a l
   const hostId = 'a'.repeat(64)
   const publicDir = cragSubscriptionPublicDirectory(root)
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
-  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  // Explicit modes: crag-license rejects group-writable public files, and a
+  // developer umask of 0002 would otherwise create them that way.
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
   const publish = (revision, slotLimit) => {
     const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
-    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code, { mode: 0o644 })
   }
   publish(1, 2)
   for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
@@ -783,6 +785,67 @@ test('fable family cooldown still allows sonnet on the same account', async (t) 
   assert.equal(sonnet.ok, true)
   assert.equal(sonnet.accountId, 'account-1')
   sonnet.release()
+})
+
+for (const source of ['usage', 'model-cooldown']) {
+  test(`Fable quota from ${source} returns 429 without dispatch and leaves Opus available`, async (t) => {
+    const root = project()
+    const repo = new RuntimeRepo()
+    const resetAt = Date.now() + 109005_000
+    const pool = scheduler(root, {
+      runtimeRepo: repo,
+      accountQuota: {
+        canAccept: () => ({ ok: true }),
+        fableWindowLimited: () => source === 'usage',
+        fableWindowResetAt: () => resetAt,
+      },
+    })
+    t.after(() => cleanupProject(root, pool))
+    if (source === 'model-cooldown') {
+      pool.markCooldown(
+        { accountId: 'account-1', vmId: 'vm-01' },
+        { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+      )
+    }
+    const result = await new FailoverRunner({ scheduler: pool }).run({
+      requestId: `fable-quota-${source}`,
+      model: 'claude-fable-5-2',
+      pinVmId: 'vm-01',
+      callAttempt: () => assert.fail('known exhausted Fable quota must not reach the upstream'),
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.body.error.code, 'pool_fable_rate_limited')
+    assert.match(result.body.error.message, /Fable/)
+    assert.ok(result.retryAfterSec > 109000)
+    const opus = await pool.selectAndReserve({
+      model: 'claude-opus-5-5',
+      pinVmId: 'vm-01',
+      allowWait: false,
+    })
+    assert.equal(opus.ok, true)
+    assert.equal(opus.accountId, 'account-1')
+    opus.release()
+  })
+}
+
+test('a pool split between Fable and shared quota exhaustion still returns 429', async (t) => {
+  const root = project()
+  const repo = new RuntimeRepo()
+  const resetAt = Date.now() + 60_000
+  const pool = scheduler(root, { runtimeRepo: repo })
+  t.after(() => cleanupProject(root, pool))
+  pool.markCooldown(
+    { accountId: 'account-1', vmId: 'vm-01' },
+    { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+  )
+  repo.markCooldown('account-2', { vmId: 'vm-02', until: resetAt, reason: 'quota_5h_header' })
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'mixed-quota',
+    model: 'claude-fable-5-2',
+    callAttempt: () => assert.fail('all candidates have known quota exhaustion'),
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
 })
 
 test('fable concurrency cap leaves room for other models', async (t) => {
@@ -3486,7 +3549,7 @@ test('weekly pace allocates a new Claude conversation by quota per day and keeps
   ])
   const pool = scheduler(root, {
     accountQuota: { repo, canAccept: () => ({ ok: true }) },
-    config: { strategy: 'weekly_pace' },
+    config: { strategy: 'weekly_pace', max_subagents_per_session: 1 },
     stickyRouter: {
       resolve: (key) => (key === 'existing' ? { vmId: 'vm-01', accountId: 'account-1' } : null),
     },
@@ -3500,6 +3563,7 @@ test('weekly pace allocates a new Claude conversation by quota per day and keeps
   })
   assert.equal(fresh.vmId, 'vm-02')
   assert.equal(fresh.selectionReason, 'weekly_pace')
+  assert.equal(pool.planner.rootVm(fresh.seatKey), 'vm-02')
   fresh.release()
 
   const existing = await pool.selectAndReserve({
@@ -3537,7 +3601,7 @@ test('weekly pace ranks all eligible VMs when a new Claude conversation leaves t
       ]),
       canAccept: () => ({ ok: true }),
     },
-    config: { strategy: 'weekly_pace' },
+    config: { strategy: 'weekly_pace', max_subagents_per_session: 1 },
   })
   const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
   const ticket = pool.enqueueTicket({
@@ -3546,10 +3610,12 @@ test('weekly pace ranks all eligible VMs when a new Claude conversation leaves t
     vmId: null,
     candidates: new Map(candidates.map((candidate) => [candidate.vmId, candidate])),
     deadline: now + 30000,
+    primary: true,
     newConversation: true,
   })
   pool.planner.pump('vm-01')
   assert.equal(ticket.granted?.candidate.vmId, 'vm-02')
+  assert.equal(pool.planner.rootVm('seat:sess:weekly-queued'), 'vm-02')
   pool.planner.forgetGranted(ticket)
   ticket.granted.reservation.release()
 })
@@ -3742,6 +3808,38 @@ test('keep_pin_on_model_gate: a model the pinned slot does not allow borrows ano
   }
 })
 
+test('shared scheduler reserves host-managed Gemini accounts under the same concurrency cap', (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const candidates = ['acc-1', 'acc-2'].map((id, index) => ({
+    accountId: `gemini:${id}`,
+    vmId: `gemini:${id}`,
+    model: 'gemini-3.8-flash-low',
+    maxConcurrency: 1,
+    priority: 0,
+    weight: 1,
+    lastUsedAt: index,
+  }))
+  const first = pool.reserveExternalCandidates(candidates)
+  const second = pool.reserveExternalCandidates(candidates)
+  assert.ok(first)
+  assert.ok(second)
+  assert.notEqual(second.selected.accountId, first.selected.accountId)
+  assert.equal(pool.inflight.get(first.selected.accountId), 1)
+  assert.equal(pool.inflight.get(second.selected.accountId), 1)
+  assert.equal(pool.reserveExternalCandidates(candidates), null)
+  first.reservation.release()
+  const next = pool.reserveExternalCandidates(candidates)
+  assert.equal(next.selected.accountId, first.selected.accountId)
+  next.reservation.release()
+  second.reservation.release()
+  pool.lastUsed.set(first.selected.accountId, 100)
+  const balanced = pool.reserveExternalCandidates(candidates)
+  assert.equal(balanced.selected.accountId, second.selected.accountId)
+  balanced.reservation.release()
+})
+
 test('fresh_account_isolation_ms: a pinned conversation never spills onto a freshly onboarded account', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -3880,4 +3978,29 @@ test('fresh_account_isolation_ms: bootstrap escape releases a continuing convers
   assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
   assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
   served.release()
+})
+
+test('a cold health cache is probed for every slot at once, not one slot after another', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let inflight = 0
+  let peak = 0
+  const calls = []
+  const pool = scheduler(root, {
+    workerHealth: async ({ vmId }) => {
+      calls.push(vmId)
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inflight--
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.ok(candidates.length >= 2)
+  assert.ok(peak >= 2, `health hops overlapped (peak ${peak})`)
+  assert.equal(new Set(calls).size, calls.length, 'each slot is probed once per scan')
+  // Warm cache: no further hops.
+  await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.equal(calls.length, candidates.length)
 })

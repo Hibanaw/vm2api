@@ -64,7 +64,13 @@ jobs:
           UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          baseline=a63ce9a3708d40ca33ee4fc6b5d3bdd48a181698
+          baseline=a5f88bf4919b55cfc355016cf7c65150cec807a0 # v1.4.214
+          patch_head=HEAD
+          if [[ $(printf '%s\n' v1.4.214 "$UPSTREAM_TAG" | sort -V | head -1) != v1.4.214 ]]; then
+            # Manual builds of older releases use the patch from before this merge.
+            baseline=a63ce9a3708d40ca33ee4fc6b5d3bdd48a181698
+            patch_head=113a673a7a76082dd9850898c62b2514b8c46d83
+          fi
           backend=(
             src/lib/pool/credential-weight.mjs
             src/lib/pool/pool-scheduler.mjs
@@ -72,8 +78,8 @@ jobs:
             src/lib/admin/release.mjs
             scripts/panel-upgrade.sh
           )
-          git -C fork merge-base --is-ancestor "$baseline" HEAD
-          git -C fork -c core.abbrev=12 diff --binary -U1 "$baseline" HEAD -- \
+          git -C fork merge-base --is-ancestor "$baseline" "$patch_head"
+          git -C fork -c core.abbrev=12 diff --binary -U1 "$baseline" "$patch_head" -- \
             "${backend[@]}" \
             web/src/features/settings/pool-pane.tsx \
             web/src/features/settings/pool-live-panel.tsx \

@@ -56,9 +56,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
-import { vmQueryOptions } from '@/features/vm/queries'
+import { vmStatsDetailQueryOptions } from '@/features/vm/queries'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
-import { VmQuotaActions } from '@/features/vm/usage-windows'
+import {
+  ClaudeQuotaObservations,
+  VmQuotaActions,
+} from '@/features/vm/usage-windows'
 import { vmWindows } from '@/features/vm/vm-rack-model'
 import {
   projectionView,
@@ -608,7 +611,7 @@ function QuotaWindows({
         w.key === 'fable'
           ? Number(vm.window_fable_cost) || 0
           : (period?.total_cost ??
-            (w.key === '5h' ? fallback.h5 : fallback.d7)),
+            (w.key === '5h' ? fallback.h5 : w.key === '7d' ? fallback.d7 : 0)),
       requests: period ? period.requests : null,
       tokens: period ? periodTokens(period) : null,
     }
@@ -658,10 +661,15 @@ function QuotaWindows({
         title='当前窗口'
         meta='官方价'
       >
-        {current.map((cell) => (
-          <WindowLine key={cell.key} cell={cell} />
-        ))}
+        {current.length ? (
+          current.map((cell) => <WindowLine key={cell.key} cell={cell} />)
+        ) : (
+          <p className='text-xs text-muted-foreground'>
+            API Key 按量计费 · 无订阅窗口
+          </p>
+        )}
         <div className='mt-auto'>
+          <ClaudeQuotaObservations vm={vm} now={now} />
           <VmQuotaActions vm={vm} now={now} />
         </div>
       </WindowCard>
@@ -711,7 +719,7 @@ function QuotaWindows({
 }
 
 function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
-  const detail = useQuery(vmQueryOptions(vm.id))
+  const detail = useQuery(vmStatsDetailQueryOptions(vm.id, Boolean(vm.gemini)))
   const billing = detail.data?.billing
   const usage = billing?.usage_stats ?? null
   const view = summarizeUsageStats(usage)
@@ -737,7 +745,13 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         <div className='flex shrink-0 items-center gap-1.5'>
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           <span className='text-xs text-muted-foreground'>
-            {vmRunning(vm) ? '运行' : '停止'}
+            {vm.gemini
+              ? vm.gemini.runtime_ready
+                ? '已预热'
+                : '宿主机'
+              : vmRunning(vm)
+                ? '运行'
+                : '停止'}
           </span>
         </div>
       </div>

@@ -38,6 +38,7 @@ const EXPORT_LIMIT_MAX = 5000
 /** Newest rows an export reads when classes must be filtered in JS. */
 const EXPORT_SCAN_CAP = 10000
 const DEFAULT_VIA = 'go-worker-pool'
+const FAILED_ONLY_PRED = `((status IS NULL OR status < 200 OR status >= 300) OR (final_state IS NOT NULL AND final_state != '' AND final_state != 'verified') OR ${ERROR_PRED})`
 
 const BLOCKED_STATES = {
   distill_blocked: 'distill',
@@ -143,18 +144,9 @@ function specialSettings(row) {
     out.push({ key: 'mismatch', label: '模型重定向', value: `${row.requested_model} → ${row.upstream_model}` })
   if (row.speed === 'fast') out.push({ key: 'fast', label: 'Fast 模式', value: row.speed })
   if (row.service_tier === 'priority') out.push({ key: 'priority', label: 'Priority', value: row.service_tier })
-  // Sent priority, upstream echoed another tier: Codex did not serve it as Fast (#777).
-  if (
-    (row.service_tier === 'priority' || row.service_tier === 'fast') &&
-    row.upstream_service_tier &&
-    row.upstream_service_tier !== 'priority' &&
-    row.upstream_service_tier !== 'fast'
-  )
-    out.push({
-      key: 'tier_downgrade',
-      label: 'Fast 未生效',
-      value: `${row.service_tier} → ${row.upstream_service_tier}`,
-    })
+  if (row.service_tier === 'ultrafast') out.push({ key: 'ultrafast', label: 'Ultrafast', value: row.service_tier })
+  if (['priority', 'fast', 'ultrafast'].includes(row.service_tier) && row.upstream_service_tier)
+    out.push({ key: 'upstream_service_tier', label: '上游档位回显', value: row.upstream_service_tier })
   if (row.long_context === 1) out.push({ key: 'context1m', label: '1M 上下文' })
   if (row.via && row.via !== DEFAULT_VIA) out.push({ key: 'via', label: '路由', value: row.via })
   return out
@@ -359,6 +351,7 @@ function buildFilter(filters, defaultMuted) {
   if (filters.debug_only) where.push("log_mode = 'debug'")
   // Legacy export `status=error`: the error predicate without picking a class.
   if (filters.errors_only) where.push(ERROR_PRED)
+  if (filters.failed_only) where.push(FAILED_ONLY_PRED)
   const start = isoOrNull(filters.start_time)
   if (start) {
     where.push('created_at >= ?')
@@ -630,11 +623,11 @@ export class UsageLogsView {
   filterOptions({ owner_user_id = null } = {}) {
     const own = ownerPred(owner_user_id)
     const recentWhere = own.sql ? `WHERE ${own.sql}` : ''
-    const recent = `(SELECT * FROM usage_logs ${recentWhere} ORDER BY created_at DESC LIMIT ${RECENT_SCAN})`
-    const distinct = (col) =>
+    const recent = `(SELECT * FROM usage_logs ${recentWhere} ORDER BY created_at DESC LIMIT ${RECENT_SCAN}) _recent`
+    const distinct = (col, { numeric = false } = {}) =>
       this.db
         .prepare(
-          `SELECT ${col} AS v FROM ${recent} WHERE ${col} IS NOT NULL AND ${col} != '' GROUP BY ${col} ORDER BY MAX(created_at) DESC LIMIT ${OPTION_LIMIT}`,
+          `SELECT ${col} AS v FROM ${recent} WHERE ${col} IS NOT NULL${numeric ? '' : ` AND ${col} != ''`} GROUP BY ${col} ORDER BY MAX(created_at) DESC LIMIT ${OPTION_LIMIT}`,
         )
         .all(...own.params)
         .map((r) => r.v)
@@ -679,7 +672,7 @@ export class UsageLogsView {
       models: uniq([...distinct('model'), ...distinct('requested_model')]).sort(),
       protocols: distinct('protocol').sort(),
       endpoints: distinct('path').sort(),
-      statusCodes: distinct('status')
+      statusCodes: distinct('status', { numeric: true })
         .map(Number)
         .sort((a, b) => a - b),
     }
@@ -708,7 +701,7 @@ export class UsageLogsView {
     if (own.sql) where.push(own.sql)
     return this.db
       .prepare(
-        `SELECT sid FROM (SELECT outbound_session_id AS sid, created_at FROM usage_logs WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ${RECENT_SCAN}) GROUP BY sid ORDER BY MAX(created_at) DESC LIMIT ?`,
+        `SELECT sid FROM (SELECT outbound_session_id AS sid, created_at FROM usage_logs WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ${RECENT_SCAN}) _recent GROUP BY sid ORDER BY MAX(created_at) DESC LIMIT ?`,
       )
       .all(...own.params, n)
       .map((r) => r.sid)

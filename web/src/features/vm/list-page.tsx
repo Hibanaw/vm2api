@@ -33,8 +33,15 @@ import { meQueryOptions } from '@/features/auth/queries'
 import {
   GeminiStartupStatus,
   geminiInventoryOptions,
+  geminiPayloadIssue,
 } from '@/features/import/gemini-environments'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+} from '@/features/import/gemini-operations'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { proxiesQueryOptions } from '@/features/proxies/queries'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import {
@@ -125,6 +132,7 @@ export function VmListPage() {
   const vmsQ = useQuery(vmsListQueryOptions(5000))
   const isAdmin = me.data?.role === 'admin'
   const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
+  const proxies = useQuery({ ...proxiesQueryOptions(), enabled: isAdmin })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -186,13 +194,20 @@ export function VmListPage() {
   const deleteVm = useMutation({
     mutationFn: async ({
       id,
+      gemini,
       switchTo,
       force,
     }: {
       id: string
+      gemini?: boolean
       switchTo?: string
       force?: boolean
     }) => {
+      if (gemini) {
+        return api<VmDeleteResult>(geminiResource(id), {
+          method: 'DELETE',
+        })
+      }
       if (switchTo) {
         await api(`/api/panel/vms/${encodeURIComponent(switchTo)}/activate`, {
           method: 'POST',
@@ -202,10 +217,15 @@ export function VmListPage() {
         method: 'DELETE',
       })
     },
-    onSuccess: async (data, { id, switchTo }) => {
+    onSuccess: async (data, { id, gemini, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
       setForceDelete(false)
+      if (gemini) {
+        toast.success(`已删除 ${id}`)
+        await qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
+        return
+      }
       await completeVmDeletion(
         qc,
         data,
@@ -216,11 +236,17 @@ export function VmListPage() {
   })
   const vms: Vm[] = vmsQ.data?.items || []
   const geminiInventory = isAdmin ? gemini.data : undefined
+  const geminiNeedsMaintenance =
+    gemini.isError ||
+    (geminiInventory &&
+      (!geminiInventory.available ||
+        !!geminiPayloadIssue(geminiInventory) ||
+        !!geminiInventory.oauth_runtime_issue))
   const slots = geminiInventory?.available
     ? [
         ...vms,
         ...geminiInventory.environments.map((environment) =>
-          geminiSlot(environment, geminiInventory)
+          geminiSlot(environment, geminiInventory, proxies.data?.proxies)
         ),
       ]
     : vms
@@ -246,7 +272,7 @@ export function VmListPage() {
       fluid
       extra={
         poolQueue || canCreate ? (
-          <div className='flex items-center gap-3'>
+          <div className='flex flex-wrap items-center gap-3'>
             {poolQueue ? (
               <span
                 className={cn(
@@ -266,6 +292,9 @@ export function VmListPage() {
                 </Link>
               </Button>
             ) : null}
+            {isAdmin && kind !== 'gemini' && geminiNeedsMaintenance ? (
+              <GeminiMaintenanceLink />
+            ) : null}
             {canCreate ? (
               <Button onClick={() => setCreateOpen(true)}>创建</Button>
             ) : null}
@@ -278,7 +307,14 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
-        {kind === 'gemini' && geminiInventory ? (
+        {isAdmin && kind === 'gemini' && gemini.isError ? (
+          <div className='mb-3 space-y-1'>
+            <p role='alert' className='text-sm text-destructive'>
+              读取 Gemini 环境失败，可前往设置诊断宿主服务。
+            </p>
+            <GeminiMaintenanceLink />
+          </div>
+        ) : kind === 'gemini' && geminiInventory ? (
           <div className='mb-3'>
             <GeminiStartupStatus inventory={geminiInventory} />
           </div>
@@ -406,6 +442,7 @@ export function VmListPage() {
           </div>
         </div>
         <VmActionsProvider
+          slots={slots}
           accounts={accounts}
           onReset={
             perms.admin
@@ -558,6 +595,7 @@ export function VmListPage() {
           if (deleteTarget && !deleteBlocked) {
             deleteVm.mutate({
               id: deleteTarget.id,
+              gemini: Boolean(deleteTarget.gemini),
               switchTo: deleteSwitchId,
               force: forceDelete && !!nodeGone,
             })
@@ -586,6 +624,7 @@ export function VmListPage() {
             ) {
               deleteVm.mutate({
                 id: deleteTarget.id,
+                gemini: Boolean(deleteTarget.gemini),
                 switchTo: deleteSwitchId,
                 force: forceDelete && !!nodeGone,
               })

@@ -124,8 +124,15 @@ export function KeyLimitsDialog({
       const group = pooled ? 'pool' : groupOf(initial.group_type)
       setDraft({
         name: initial.name || '',
-        category: initial.category === 'api' ? 'api' : 'oauth',
+        category:
+          initial.category === 'api'
+            ? 'api'
+            : initial.category === 'all'
+              ? 'all'
+              : 'oauth',
         api_endpoint_id: initial.api_endpoint_id || '',
+        permission_tier: initial.permission_tier,
+        owner_id: initial.owner_id,
         max_concurrency: Number(initial.max_concurrency ?? 20),
         quota_requests: Number(initial.quota_requests ?? 0),
         quota_usd: Number(initial.quota_usd ?? 0),
@@ -206,8 +213,10 @@ export function KeyLimitsDialog({
                 onValueChange={(v) =>
                   setDraft((d) => ({
                     ...d,
-                    category: v === 'api' ? 'api' : 'oauth',
-                    api_endpoint_id: v === 'api' ? d.api_endpoint_id : '',
+                    category:
+                      v === 'api' ? 'api' : v === 'all' ? 'all' : 'oauth',
+                    api_endpoint_id:
+                      v === 'api' || v === 'all' ? d.api_endpoint_id : '',
                     group_type:
                       v === 'api' &&
                       (d.group_type === 'pool' || d.group_type === 'gemini')
@@ -224,6 +233,9 @@ export function KeyLimitsDialog({
                 <SelectContent>
                   <SelectItem value='oauth'>OAuth 槽位</SelectItem>
                   <SelectItem value='api'>API 直连</SelectItem>
+                  {draft.category === 'all' || initial?.category === 'all' ? (
+                    <SelectItem value='all'>全部（OAuth + API）</SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </Field>
@@ -319,7 +331,9 @@ export function KeyLimitsDialog({
               <p className='text-xs text-muted-foreground'>
                 {selectedChannel
                   ? selectedChannel.models?.length
-                    ? `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
+                    ? selectedChannel.protocol === 'gemini'
+                      ? `已保存 ${selectedChannel.models.length} 个模型；默认走原生 Gemini（/v1beta 与 /v1），同时支持 OpenAI / Anthropic 多协议调用。`
+                      : `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
                     : '此渠道尚未保存模型。请先到 API 页面获取模型。'
                   : channelsError
                     ? '无法加载 API 渠道。请重试。'
@@ -410,8 +424,9 @@ export function KeyLimitsDialog({
               </Field>
             ) : draft.group_type === 'gemini' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>
-                仅用于 Gemini 宿主机账号，不使用 VM
-                或直连渠道。请求会在已授权且已拉取模型的账号之间调度。
+                仅用于 Gemini 宿主机账号，不使用 VM 或直连渠道。默认支持原生
+                Gemini（/v1beta 与 /v1），同时兼容 OpenAI Chat / Responses 与
+                Anthropic Messages 协议。
               </p>
             ) : draft.group_type === 'all' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>

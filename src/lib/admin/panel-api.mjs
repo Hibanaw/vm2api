@@ -6,10 +6,13 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { isBlockableClientId } from '../identity/blocked-clients.mjs'
 import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pressure.mjs'
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
+import { normalizeGeminiRouting } from '../gemini/routing-config.mjs'
+import { CRAGGEMINI_PERSONA_PRESETS, CRAGGEMINI_SYSTEM_PROMPT_MAX } from '../gemini/system-prompt.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
@@ -41,7 +44,7 @@ import { probeAccount } from '../oauth/usage-probe.mjs'
 import { queryOpenaiQuota, resetOpenaiQuota } from '../oauth/openai-quota.mjs'
 import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../oauth/claude-reset-credits.mjs'
 import { canOfficialUsage, credentialModeOfVm, isSetupTokenMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { nodePlatform } from '../cluster/placement.mjs'
@@ -50,6 +53,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
 import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
@@ -58,7 +62,7 @@ import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
-import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
+import { accountIdOf, familyLimitsOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel, weeklyPaceScore } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -106,7 +110,11 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
-import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  telemetryUploadInterval,
+} from '../vm/native-telemetry.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -447,6 +455,25 @@ export function validatePersonaRoutingPatch(body = {}) {
       problems.push(`crag_persona_preset 必须是 official_full / zero，收到 ${raw}`)
     }
   }
+  if (compat.craggemini_persona_preset != null && String(compat.craggemini_persona_preset).trim() !== '') {
+    const raw = String(compat.craggemini_persona_preset).trim()
+    if (!CRAGGEMINI_PERSONA_PRESETS.includes(raw)) {
+      problems.push(`craggemini_persona_preset 必须是 ${CRAGGEMINI_PERSONA_PRESETS.join(' / ')}，收到 ${raw}`)
+    }
+  }
+  if (compat.craggemini_system_prompt != null) {
+    if (typeof compat.craggemini_system_prompt !== 'string') {
+      problems.push('craggemini_system_prompt 必须是字符串')
+    } else if (compat.craggemini_system_prompt.length > CRAGGEMINI_SYSTEM_PROMPT_MAX) {
+      problems.push(`craggemini_system_prompt 超过 ${CRAGGEMINI_SYSTEM_PROMPT_MAX} 字符`)
+    }
+  }
+  if (compat.craggemini_prompt_normalization != null && String(compat.craggemini_prompt_normalization).trim() !== '') {
+    const raw = String(compat.craggemini_prompt_normalization).trim()
+    if (raw !== 'auto' && raw !== 'strict' && raw !== 'off') {
+      problems.push(`craggemini_prompt_normalization 必须是 auto / strict / off，收到 ${raw}`)
+    }
+  }
   if (compat.overlay_preset != null && String(compat.overlay_preset).trim() !== '') {
     const raw = String(compat.overlay_preset).trim()
     if (!OVERLAY_PRESETS.includes(raw)) {
@@ -530,6 +557,24 @@ export function validatePersonaRoutingPatch(body = {}) {
   }
   if (compat.claude_code_only != null && typeof compat.claude_code_only !== 'boolean') {
     problems.push('claude_code_only 必须是布尔')
+  }
+  if (compat.count_tokens != null && typeof compat.count_tokens !== 'boolean') {
+    problems.push('count_tokens 必须是布尔')
+  }
+  if (compat.blocked_clients != null) {
+    const map = compat.blocked_clients
+    if (typeof map !== 'object' || Array.isArray(map)) problems.push('blocked_clients 必须是对象')
+    else {
+      for (const [id, on] of Object.entries(map)) {
+        // An unknown id is ignored rather than rejected, matching how
+        // blockedClientsFromRouting reads the same map. Rejecting it would mean that
+        // retiring or renaming an entry in BLOCKABLE_CLIENTS leaves a key in the
+        // stored routing.json that makes *every* later protocol-settings save fail,
+        // recoverable only by hand-editing that file.
+        if (!isBlockableClientId(id)) continue
+        if (typeof on !== 'boolean') problems.push(`blocked_clients.${id} 必须是布尔`)
+      }
+    }
   }
   if (compat.official_cc_passthrough != null && typeof compat.official_cc_passthrough !== 'boolean') {
     problems.push('official_cc_passthrough 必须是布尔')
@@ -1081,7 +1126,17 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, transport, now } = {}) {
+export async function buildClaudeResetRedeem({
+  cfg,
+  accountQuota = null,
+  usageCache = null,
+  id,
+  idempotencyKey,
+  card,
+  transport,
+  now,
+} = {}) {
+  const clock = typeof now === 'function' ? now : () => Date.now()
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
@@ -1089,6 +1144,24 @@ export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, tr
     card,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
+    onResetConfirmed: accountQuota?.recordQuotaReset
+      ? ({ accountId, receiptAccountId, operationId, cleared, at, replayed }) => {
+          // A replayed receipt created before a slot was rebound must not affect the new account.
+          if (!accountId || !receiptAccountId || receiptAccountId !== accountId) return
+          const recorded = accountQuota.recordQuotaReset(accountId, {
+            cleared,
+            at,
+            operationId,
+            now: clock(),
+            replayed,
+          })
+          if (recorded?.applied) {
+            try {
+              ;(usageCache || getUsageCache()).clear(accountId)
+            } catch {}
+          }
+        }
+      : null,
   })
   if (!result.ok) return claudeResetFail(result)
   return ok({
@@ -1235,7 +1308,16 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(
+        accountId,
+        async () => {
+          const startedAt = Date.now()
+          const resetGenerations = accountQuota.resetGenerations?.(accountId) || null
+          const probed = await probeAccount({ exec, vm, includeFable })
+          return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+        },
+        { force: !!force },
+      )
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1250,7 +1332,13 @@ export async function buildProbeOne({
   const profile = [result, acc?.unified, vm.claude, vm].find(
     (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
   )
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (!skipHop) {
+    const fetchMeta = getUsageFetchMeta(result)
+    accountQuota.ingestOAuthUsage(accountId, result, {
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
+    })
+  }
   if (result.subscription_type) {
     persistVmSubscription(cfg.paths.project, id, result, {
       accountUuid: vm.claude?.account_uuid,
@@ -1553,11 +1641,13 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     tiers,
     logging: routingConfig?.logging || {},
     pool: normalizePoolRouting(routingConfig?.pool),
+    batch_group: mergeBatchGroupConfig(routingConfig?.batch_group),
     failover: routingConfig?.failover || {},
     compatibility: presentCompatibility(routingConfig?.compatibility),
     inference: presentInference(routingConfig?.inference),
     websocket: normalizeInferenceWebsocket(routingConfig?.websocket),
     codex: normalizeCodexRouting(routingConfig?.codex),
+    gemini: normalizeGeminiRouting(routingConfig?.gemini),
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
@@ -1566,6 +1656,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     telemetry: {
       upload_interval_seconds: telemetryUploadInterval(routingConfig),
       default_enabled: telemetryDefaultEnabled(routingConfig),
+      disable_nonessential_traffic: telemetryDisableNonessentialTraffic(routingConfig),
     },
     redaction: normalizeRedaction(routingConfig?.redaction),
     redaction_runtime: redactionStatus(),
@@ -1664,6 +1755,29 @@ function activeFableCreditsRequired(unified, now = Date.now()) {
   return { model: mark.model || null, at: mark.at || null, until: mark.until }
 }
 
+// Display-only snapshots. Do not promote legacy aliases or aggregate update times
+// to fresh per-window observations, and do not feed this projection into admission.
+function quotaObservations(u) {
+  const window = (w) => {
+    if (!w || typeof w !== 'object') return null
+    const value = w.utilization == null || w.utilization === '' ? null : Number(w.utilization)
+    return {
+      utilization: value != null && Number.isFinite(value) ? value : null,
+      status: typeof w.status === 'string' ? w.status : null,
+      reset: w.reset || w.resets_at || null,
+      sampled_at: w.sampled_at || null,
+      stale: w.stale === true,
+    }
+  }
+  return {
+    official: u.official
+      ? { updated_at: u.official.updated_at || null, '5h': window(u.official['5h']), '7d': window(u.official['7d']) }
+      : null,
+    // This store can also contain copies from official usage; it is not raw headers.
+    passive: { '5h': window(u.headers?.['5h']), '7d': window(u.headers?.['7d']) },
+  }
+}
+
 export function quotaFromAccount(acc, quotaConfig) {
   const u = acc?.unified || {}
   const listed = listQuotaFromHeaders(u)
@@ -1695,6 +1809,7 @@ export function quotaFromAccount(acc, quotaConfig) {
   const effectiveStatus5 = o5Limited ? 'rejected' : listed.status_5h || o5.status || null
   const effectiveStatus7 = o7Limited ? 'rejected' : listed.status_7d || o7.status || null
   const q = {
+    quota_observations: quotaObservations(u),
     utilization_5h: effectiveU5,
     utilization_7d: effectiveU7,
     utilization_7d_sonnet: sonnet.utilization != null ? Number(sonnet.utilization) : null,
@@ -2028,7 +2143,17 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     availability.reason ||
     null
   const circuit = isCodex ? null : circuitViewFor(v, extras.projectRoot)
-  const seatsMax = isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {})
+  const limits = isCodex
+    ? null
+    : familyLimitsOf(v, {
+        ...extras.routingConfig?.pool,
+        default_session_slots: extras.routingConfig?.inference?.session_slots,
+      })
+  const seatsMax = isCodex
+    ? null
+    : limits.subagents == null
+      ? resolveSessionSlots(v, extras.routingConfig || {})
+      : limits.seats
   const triad = resolveScheduleState({
     vm: v,
     availability,
@@ -2099,12 +2224,18 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     max_sessions_override: isCodex ? openAIEffective.sessions_override : false,
     session_slots: isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {}),
     session_slots_override: isCodex ? false : v.session_slots_override === true,
+    max_primary_sessions: limits?.primary ?? null,
+    max_primary_sessions_override: !isCodex && v.max_primary_sessions_override === true,
+    max_subagents_per_session: limits?.subagents ?? null,
+    max_subagents_per_session_override: !isCodex && v.max_subagents_per_session_override === true,
     // What each knob falls back to when the slot drops its pin (PATCH field = null).
     scheduling_inherited: {
       max_concurrency: Number(inheritedPolicy.max_concurrency ?? 2),
       max_rpm: Number(inheritedPolicy.max_rpm ?? 0),
       max_sessions: isCodex ? Number(inheritedPolicy.max_sessions ?? 0) : null,
       session_slots: isCodex ? null : normalizeSessionSlots(extras.routingConfig?.inference?.session_slots),
+      max_primary_sessions: limits?.inheritedPrimary ?? null,
+      max_subagents_per_session: limits?.inheritedSubagents ?? null,
     },
     quota_override: quotaOverride,
     quota_policy: isCodex ? null : vmQuotaView(policy, vmQuotaConfig),
@@ -2121,6 +2252,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     // Window state on its own: availability may carry a stronger reason (cool, quota).
     active_hours_active: activeHours ? activeHoursState.active : null,
     claude_code_version: v.claude_code_version,
+    quota_observations:
+      isCodex || acc?.account_id !== (v.account_uuid || v.claude?.account_uuid || v.id) ? null : q.quota_observations,
     utilization_5h: u5,
     utilization_7d: u7,
     utilization_7d_sonnet: isCodex ? null : q.utilization_7d_sonnet,
@@ -2195,6 +2328,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     unschedulable_reason: triad.unschedulable_reason,
     unschedulable_text: triad.unschedulable_text,
     unschedulable_detail: triad.unschedulable_detail,
+    unschedulable_at: v.unschedulable?.at || null,
     // Claude unit circuit (Codex has its own failover set and never trips it).
     circuit,
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,

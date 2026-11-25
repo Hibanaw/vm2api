@@ -216,6 +216,17 @@ EOF
   fi
 fi
 
+# Protect existing SQLite deployments when upgrading to PG-capable releases:
+# do not let docker-compose.yml's default DATABASE_HOST flip an unmigrated kin.db onto PostgreSQL.
+upgrade_env=.env
+if [ -n "$QUOTA_IMAGE" ]; then upgrade_env=$pending_env; fi
+if [ -f data/kin.db ]; then
+  touch "$upgrade_env"
+  if ! grep -qE '^(VM2API_DB_DRIVER|DATABASE_URL|VM2API_DATABASE_URL)=' "$upgrade_env"; then
+    printf '\nVM2API_DB_DRIVER=sqlite\n' >> "$upgrade_env"
+  fi
+fi
+
 if [ -n "$QUOTA_IMAGE" ]; then
   mv -f "$pending_env" .env
   trap - EXIT

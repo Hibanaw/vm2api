@@ -73,6 +73,13 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type VmCodexCredits = {
+  has_credits?: boolean
+  unlimited?: boolean
+  balance?: string | number | null
+  fetched_at?: string | number | null
+}
+
 export type CragLicenseStatus = {
   status:
     | 'unlicensed'
@@ -251,9 +258,20 @@ export type SeatOccupant = {
   state: 'active' | 'held' | 'idle' | string
   inflight: number
   held_until?: number | null
+  subagents_running?: number
+  subagents_queued?: number
+  subagents_max?: number | null
 }
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
+
+export type QuotaObservation = {
+  utilization: number | null
+  status: string | null
+  reset: string | null
+  sampled_at: string | null
+  stale: boolean
+}
 
 export type Vm = {
   id: string
@@ -317,15 +335,27 @@ export type Vm = {
   unschedulable_reason?: string | null
   unschedulable_text?: string | null
   unschedulable_detail?: Record<string, unknown> | null
+  /** 进入不可调度（含吊销）的时刻，ISO 字符串 */
+  unschedulable_at?: string | null
   schedule_off?: boolean
   schedule_hold?: {
     reason: string
     detail?: Record<string, unknown> | null
   } | null
-  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  /** Claude 单元熔断（Codex 为 null）。连续 400/403/5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
+  quota_observations?: {
+    official:
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
+    passive: Record<'5h' | '7d', QuotaObservation | null>
+  } | null
   utilization_5h?: number | null
   utilization_7d?: number | null
   utilization_7d_oi?: number
@@ -339,8 +369,11 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
+      label?: string
       used_percent?: number | null
       reset_at?: string | null
+      reset_after_seconds?: number | null
+      window_minutes?: number | null
     }>
     quota?: {
       utilization_5h?: number | null
@@ -358,6 +391,7 @@ export type Vm = {
     credits?: Array<{ expires_at?: string }>
     fetched_at?: string
   } | null
+  codex_credits?: VmCodexCredits | null
   /** 限额重置按钮。setup-token 标签但 scope 含 user:profile 时也为 true。 */
   can_claude_reset?: boolean
   claude_reset_credits?: {
@@ -441,6 +475,12 @@ export type Vm = {
   /** Claude CLI native 执行位热准入上限，也是预调度的席位上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** Claude family mode root-session cap. */
+  max_primary_sessions?: number | null
+  max_primary_sessions_override?: boolean
+  /** null = family mode disabled, children keep their own seats. */
+  max_subagents_per_session?: number | null
+  max_subagents_per_session_override?: boolean
   /** 去掉本槽覆盖（PATCH 字段传 null）后会落回的值。 */
   scheduling_inherited?: VmSchedulingInherited | null
   /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
@@ -840,6 +880,8 @@ export type VmSchedulingInherited = {
   max_sessions?: number | null
   /** Codex 行为 null。 */
   session_slots: number | null
+  max_primary_sessions?: number | null
+  max_subagents_per_session?: number | null
 }
 
 export type OpenAIQuotaPolicy = {

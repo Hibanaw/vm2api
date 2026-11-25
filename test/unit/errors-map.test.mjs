@@ -466,6 +466,37 @@ test('a terminal upstream verdict survives the relay so clients stop retrying (#
     assert.equal(nonretryable.body.error.details.retryable, false)
   }
 
+  // Safe diagnostic metadata from CRAG's partial-continuation 409 is preserved
+  // while unknown/nested fields are dropped and retryable stays false.
+  const detailedPartial = mapUpstreamError(409, {
+    error: {
+      type: 'partial_provider_output_nonretryable',
+      message:
+        'Provider output for this continuation was interrupted and cannot be replayed immediately. Wait 20s before retrying.',
+      details: {
+        retryable: true,
+        prior_reason: 'client_cancelled',
+        interrupted_at: 1795495209,
+        retry_after_sec: 20,
+        recovery_attempts: 1,
+        max_recoveries: 2,
+        recovery_exhausted: false,
+        internal_secret: 'must_not_leak',
+        nested: { nope: true },
+      },
+    },
+  })
+  assert.equal(detailedPartial.status, 409)
+  assert.equal(detailedPartial.body.error.details.retryable, false)
+  assert.equal(detailedPartial.body.error.details.prior_reason, 'client_cancelled')
+  assert.equal(detailedPartial.body.error.details.interrupted_at, 1795495209)
+  assert.equal(detailedPartial.body.error.details.retry_after_sec, 20)
+  assert.equal(detailedPartial.body.error.details.recovery_attempts, 1)
+  assert.equal(detailedPartial.body.error.details.max_recoveries, 2)
+  assert.equal(detailedPartial.body.error.details.recovery_exhausted, false)
+  assert.equal(detailedPartial.body.error.details.internal_secret, undefined)
+  assert.equal(detailedPartial.body.error.details.nested, undefined)
+
   // Capacity errors keep the panel's own Retry-After policy: a client must still
   // retry a 429/529, so no terminal hint is attached there.
   const limited = mapUpstreamError(429, {
@@ -499,6 +530,15 @@ test('pool-wide cooldowns: 529 overload cooldown is capacity, 429 cooldown is a 
   assert.ok(limited.retryAfterSec >= 1)
 })
 
+test('Fable pool quota keeps its 429 and model-specific message at the client boundary', () => {
+  const limited = rewritePoolErrorForClient(null, { error: { code: 'pool_fable_rate_limited' } })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.type, 'rate_limit_error')
+  assert.equal(limited.body.error.code, 'upstream_rate_limit')
+  assert.match(limited.body.error.message, /Fable/)
+  assert.ok(limited.retryAfterSec >= 1)
+})
+
 test('poolErrorKind separates capacity from nothing-eligible and leaves upstream errors alone', () => {
   assert.equal(poolErrorKind('pool_overloaded'), 'overloaded')
   assert.equal(poolErrorKind('account_pool_exhausted'), 'unavailable')
@@ -506,4 +546,31 @@ test('poolErrorKind separates capacity from nothing-eligible and leaves upstream
   assert.equal(poolErrorKind('upstream_error', 'No eligible Claude accounts remain'), 'unavailable')
   assert.equal(poolErrorKind('upstream_rate_limit', 'Rate limit exceeded'), null)
   assert.equal(poolErrorKind('incomplete_response'), null)
+})
+
+test('#1215: 410 Gone forwards allowlisted continuation expiration reason and drops unknown fields', () => {
+  for (const reason of ['waiting_expired', 'handoff_expired', 'receipt_expired', 'cancelled']) {
+    const mapped = mapUpstreamError(410, {
+      error: {
+        type: 'invalid_request_error',
+        message: 'MCP continuation is no longer available',
+        details: { retryable: false, reason, internal_secret: 'must_not_leak' },
+      },
+    })
+    assert.equal(mapped.status, 410)
+    assert.equal(mapped.body.error.details.retryable, false)
+    assert.equal(mapped.body.error.details.reason, reason)
+    assert.equal(mapped.body.error.details.internal_secret, undefined)
+  }
+
+  const unknownReason = mapUpstreamError(410, {
+    error: {
+      type: 'invalid_request_error',
+      message: 'gone',
+      details: { retryable: false, reason: 'arbitrary_untrusted_text' },
+    },
+  })
+  assert.equal(unknownReason.status, 410)
+  assert.equal(unknownReason.body.error.details.retryable, false)
+  assert.equal(unknownReason.body.error.details.reason, undefined)
 })
