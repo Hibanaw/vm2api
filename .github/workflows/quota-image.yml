@@ -64,12 +64,15 @@ jobs:
           UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          baseline=a5f88bf4919b55cfc355016cf7c65150cec807a0 # v1.4.214
+          baseline=716fc481669cce7c01cd2115d1a501c4d46a54d7
           patch_head=HEAD
           if [[ $(printf '%s\n' v1.4.214 "$UPSTREAM_TAG" | sort -V | head -1) != v1.4.214 ]]; then
             # Manual builds of older releases use the patch from before this merge.
             baseline=a63ce9a3708d40ca33ee4fc6b5d3bdd48a181698
             patch_head=113a673a7a76082dd9850898c62b2514b8c46d83
+          elif [[ $(printf '%s\n' v1.4.220 "$UPSTREAM_TAG" | sort -V | head -1) != v1.4.220 ]]; then
+            baseline=a5f88bf4919b55cfc355016cf7c65150cec807a0
+            patch_head=dcc16034c9f1d72774835223892da4316e39ff2c
           fi
           backend=(
             src/lib/pool/credential-weight.mjs

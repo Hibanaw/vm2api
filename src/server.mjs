@@ -95,6 +95,7 @@ import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { apiScheduleScope, resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
+import { bootProtoFront } from './lib/transport/proto-front-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
@@ -1436,6 +1437,7 @@ const geminiScheduler = createGeminiScheduler({
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
   getAttemptsRepo: () => attemptsRepo,
+  listCacheTtlMs: 2000,
 })
 const handleGeminiPublic = createGeminiPublicHandler({
   json,
@@ -1975,6 +1977,7 @@ const server = http.createServer(async (req, res) => {
           routeStream: gemGen.stream,
         })
       }
+      let preloadedGemCat = null
       if (gemGen && backend === 'all') {
         const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
         const gemScope = {
@@ -1989,6 +1992,7 @@ const server = http.createServer(async (req, res) => {
         let hasOwnedGemEnv = false
         try {
           const cat = await geminiScheduler.catalog(gemScope)
+          preloadedGemCat = cat
           hasOwnedGemEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
         } catch {
           hasOwnedGemEnv = false
@@ -2003,7 +2007,7 @@ const server = http.createServer(async (req, res) => {
           })
         }
       }
-      return handleGeminiPublic(req, res)
+      return handleGeminiPublic(req, res, preloadedGemCat ? { catalogSnapshot: preloadedGemCat } : {})
     }
     // A shared path only belongs to Gemini when the key does. Dispatching on
     // the path alone would make the OpenAI handlers below unreachable, and
@@ -2232,6 +2236,7 @@ if (process.env.KIN_CRS_MOCK !== '1') {
   )
 }
 await bootApiKernel(cfg)
+await bootProtoFront(cfg)
 server.keepAliveTimeout = 120_000
 server.headersTimeout = 125_000
 server.timeout = 0
@@ -2246,6 +2251,29 @@ server.listen(cfg.port, cfg.host, () => {
       void cragSubscription.recover().catch(() => {
         console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
       })
+      void geminiCragSubscription.recover().catch(() => {
+        console.warn('[crag-gemini-subscription] startup recovery failed; will retry in background')
+      })
+      let maintainingGeminiSub = false
+      const maintainGeminiSub = () => {
+        if (maintainingGeminiSub) return
+        maintainingGeminiSub = true
+        void (async () => {
+          if (geminiCragSubscription.hasSyncPending?.()) {
+            await geminiCragSubscription.recover().catch(() => {
+              console.warn('[crag-gemini-subscription] background sync-pending recovery deferred')
+            })
+          }
+          await geminiCragSubscription.refreshExpiredEntitlement?.().catch(() => {
+            console.warn('[crag-gemini-subscription] expired quota refresh deferred')
+          })
+        })().finally(() => {
+          maintainingGeminiSub = false
+        })
+      }
+      const geminiSubTimer = setInterval(maintainGeminiSub, 15_000).unref()
+      onLeaderStop(() => clearInterval(geminiSubTimer))
+      maintainGeminiSub()
       const refresh = () =>
         void cragSubscription.refreshExpiredEntitlement().catch(() => {
           console.warn('[crag-subscription] expired quota refresh deferred')

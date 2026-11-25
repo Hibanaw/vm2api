@@ -6,7 +6,13 @@ import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { hashKey } from '../core/security.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
-import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
+import {
+  defaultMaxTokensForModel,
+  getCapabilities,
+  normalizeThinkingByPolicy,
+  validateBetweenToolsThinking,
+  validateToolChoice,
+} from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
 import {
   refusalAuditIdentity,
@@ -43,6 +49,8 @@ import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
 import { isAntigravityRoutedModel } from '../gemini/model-catalog.mjs'
+import { parseGeminiGeneratePath } from '../gemini/routes.mjs'
+import { compileWithProtoFront, protoFrontMode, transcodeWithProtoFront } from '../transport/proto-front-client.mjs'
 import { isMultipartFormData, normalizeImageEditBody } from './image-edit-multipart.mjs'
 import { readRawBody } from '../http/respond.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
@@ -265,9 +273,9 @@ export function createHandleProtocol(deps) {
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
   const getBatchGroups = () =>
-  (deps.batchGroups ||= new BatchGroups({
-    onExpire: (memberKey) => stickyRouter?.unbind?.(scopeStickyKey(memberKey, 'anthropic')),
-  }))
+    (deps.batchGroups ||= new BatchGroups({
+      onExpire: (memberKey) => stickyRouter?.unbind?.(scopeStickyKey(memberKey, 'anthropic')),
+    }))
   const accountQuota = deps.accountQuota
   const apiKeyStore = deps.apiKeyStore
   const apiScheduler = deps.apiScheduler
@@ -303,7 +311,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier,
         officialCost: priced.total_cost,
       })
-    } catch { }
+    } catch {}
   }
 
   function respondKeyGateError(res, gate) {
@@ -347,7 +355,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
         officialCost: priced.total_cost,
       })
-    } catch { }
+    } catch {}
   }
 
   /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
@@ -366,7 +374,7 @@ export function createHandleProtocol(deps) {
     } finally {
       try {
         apiKeyStore.release(managedKey)
-      } catch { }
+      } catch {}
       billCodexKey(managedKey, logBag)
     }
   }
@@ -411,9 +419,9 @@ export function createHandleProtocol(deps) {
     const mapped = policyRefusal
       ? upstreamRiskClientError(logBag.risk_upstream_reason, logBag.risk_request_id)
       : rewritePoolErrorForClient(
-        mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
-        result?.body,
-      )
+          mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+          result?.body,
+        )
     if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
       mapped.body.error.details = { reason: result.poolReason }
     }
@@ -739,7 +747,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch { }
+      } catch {}
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -771,21 +779,25 @@ export function createHandleProtocol(deps) {
         }).body,
       )
     }
+    const gemPathMeta =
+      protocol === 'google.gemini' ? parseGeminiGeneratePath(String(pathName || '').split('?')[0]) : null
+    const effectiveRouteModel = routeMeta?.routeModel || gemPathMeta?.model || null
+    const effectiveRouteStream =
+      typeof routeMeta?.routeStream === 'boolean' ? routeMeta.routeStream : gemPathMeta?.stream === true
     if (
       protocol === 'google.gemini' &&
-      routeMeta?.routeModel &&
+      effectiveRouteModel &&
       inbound &&
       typeof inbound === 'object' &&
       !Array.isArray(inbound)
     ) {
-      if (!inbound.model) inbound = { ...inbound, model: routeMeta.routeModel }
+      if (!inbound.model) inbound = { ...inbound, model: effectiveRouteModel }
     }
     logBag.inbound_body = logCtx.mode === 'debug' ? inbound : null
     logBag.inbound_summary = summarizeBody(inbound)
-    logBag.model = inbound?.model || routeMeta?.routeModel || null
-    logBag.requested_model = inbound?.model || routeMeta?.routeModel || null
-    logBag.stream =
-      protocol === 'google.gemini' ? routeMeta?.routeStream === true : isClientStream(inbound, req.headers)
+    logBag.model = inbound?.model || effectiveRouteModel || null
+    logBag.requested_model = inbound?.model || effectiveRouteModel || null
+    logBag.stream = protocol === 'google.gemini' ? effectiveRouteStream : isClientStream(inbound, req.headers)
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
     const auditIdentity = refusalAuditIdentity({ inbound, headers: req.headers, principal: riskPrincipal(req) })
     logBag.session_id = sessionIdForLog(
@@ -805,6 +817,7 @@ export function createHandleProtocol(deps) {
       typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
     ) {
       let preferGeminiApiChannel = false
+      let preloadedGeminiCatalog = null
       if (rawInboundBackend === 'all') {
         const hasPinnedEndpoints =
           Boolean(inboundKeyPolicy?.api_endpoint_id) || (inboundKeyPolicy?.allowed_endpoints?.length || 0) > 0
@@ -828,6 +841,7 @@ export function createHandleProtocol(deps) {
           if (typeof deps.geminiScheduler?.catalog === 'function') {
             try {
               const cat = await deps.geminiScheduler.catalog(gemScope)
+              preloadedGeminiCatalog = cat
               hasOwnedGeminiEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
             } catch {
               hasOwnedGeminiEnv = false
@@ -845,7 +859,11 @@ export function createHandleProtocol(deps) {
       }
       if (!preferGeminiApiChannel) {
         req.body = inbound
-        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
+        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
+          logBag,
+          logCtx,
+          ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
+        })
       }
     }
 
@@ -1086,21 +1104,22 @@ export function createHandleProtocol(deps) {
     const imageModel = inferenceBackend === 'api' ? null : canonicalImageToolModel(ctx.body?.model)
     const platform = apiPicked
       ? {
-        ok: true,
-        platform:
-          apiPicked.endpoint.protocol === 'openai'
-            ? 'openai'
-            : apiPicked.endpoint.protocol === 'gemini'
-              ? 'gemini'
-              : 'anthropic',
-      }
+          ok: true,
+          platform:
+            apiPicked.endpoint.protocol === 'openai'
+              ? 'openai'
+              : apiPicked.endpoint.protocol === 'gemini'
+                ? 'gemini'
+                : 'anthropic',
+        }
       : imageModel
         ? { ok: true, platform: 'openai' }
         : detectInboundPlatform(ctx.body?.model)
+    const pfMode = protoFrontMode()
     const apiOpenAI = inferenceBackend === 'api' && platform.platform === 'openai'
     const apiGemini = inferenceBackend === 'api' && platform.platform === 'gemini'
     const apiNonAnthropic = apiOpenAI || apiGemini
-    if (protocol === 'google.gemini' && !apiGemini) {
+    if (protocol === 'google.gemini' && !apiGemini && pfMode !== 'go') {
       stats.errors++
       logBag.error_code = 'gemini_unsupported_protocol'
       logBag.error_message = 'Native Gemini endpoints require a Gemini API channel.'
@@ -1336,12 +1355,12 @@ export function createHandleProtocol(deps) {
       const accountGate = !scopedRiskGate
         ? null
         : (account) =>
-          applyProtocolIntercept({
-            ...gateArgs,
-            body: auditBody,
-            account,
-            skipMandatory: true,
-          })
+            applyProtocolIntercept({
+              ...gateArgs,
+              body: auditBody,
+              account,
+              skipMandatory: true,
+            })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1433,7 +1452,7 @@ export function createHandleProtocol(deps) {
     if (replayScope) ctx.body = issuedTools.restore(replayScope, ctx.body)
     // Recognition alone is not passthrough. Only the protocol-tab switch keeps
     // the Claude Code family body; every other inbound is rewritten below.
-    const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
+    let officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
     // Operator opt-in, per API endpoint: forward the caller's own identity and
     // billing blocks instead of preparing them for the configured persona (#1321).
     // Evaluated here on purpose -- after the risk/route pass may have re-picked
@@ -1441,20 +1460,107 @@ export function createHandleProtocol(deps) {
     // Never derived from caller input.
     const preserveApiCallerBody =
       inferenceBackend === 'api' && !apiNonAnthropic && apiPicked?.endpoint?.body_policy === 'caller'
+    const pfTarget =
+      inferenceBackend === 'api'
+        ? apiOpenAI
+          ? 'api_openai'
+          : apiGemini
+            ? 'api_gemini'
+            : 'api_anthropic'
+        : 'claude_crag'
+    let pfCompile = null
+    if (pfMode === 'go' && !apiGemini && !apiOpenAI) {
+      try {
+        pfCompile = await compileWithProtoFront({
+          cfg,
+          inboundProtocol: protocol,
+          targetFamily: pfTarget,
+          handoffMode: 'canonical',
+          reqPath: pathName,
+          headers: req.headers,
+          body: ctx.body,
+          routing: getRouting() || {},
+          endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
+          routeModel: effectiveRouteModel || ctx.body?.model || '',
+          routeStream: protocol === 'google.gemini' ? effectiveRouteStream : undefined,
+        })
+        if (pfCompile) {
+          if (inferenceBackend !== 'api' && pfCompile.decision) {
+            officialPassthrough = pfCompile.decision.allow_passthrough === true
+          }
+          logBag.hop_meta = {
+            ...logBag.hop_meta,
+            proto_front: {
+              mode: pfCompile.mode || null,
+              decision: pfCompile.decision || null,
+              stripped_fields: pfCompile.stripped_fields || [],
+            },
+          }
+        }
+      } catch (err) {
+        logBag.hop_meta = { ...logBag.hop_meta, proto_front_error: err?.code || err?.message || 'error' }
+      }
+    } else if (pfMode === 'shadow' && !apiGemini && !apiOpenAI) {
+      void compileWithProtoFront({
+        cfg,
+        inboundProtocol: protocol,
+        targetFamily: pfTarget,
+        handoffMode: 'canonical',
+        reqPath: pathName,
+        headers: req.headers,
+        body: ctx.body,
+        routing: getRouting() || {},
+        endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
+        routeModel: effectiveRouteModel || ctx.body?.model || '',
+        routeStream: protocol === 'google.gemini' ? effectiveRouteStream : undefined,
+      })
+        .then((shadowRes) => {
+          logBag.hop_meta = {
+            ...logBag.hop_meta,
+            proto_front_shadow: { ok: shadowRes?.ok === true, mode: shadowRes?.mode, decision: shadowRes?.decision },
+          }
+        })
+        .catch(() => {})
+    }
     let converted
     try {
-      converted =
-        apiGemini || (apiOpenAI && protocol === 'openai.responses')
-          ? { claude: ctx.body, mode: 'passthrough' }
-          : toClaudeMessages(protocol, ctx.body, {
-            rewrite: rewriteEnabled,
-            model_map: false,
-            preserve_content_shape: officialPassthrough,
-            onSystemBlock:
-              inferenceBackend !== 'api' && !officialPassthrough
-                ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
-                : undefined,
-          })
+      if (pfMode === 'go' && !apiGemini && !apiOpenAI && pfCompile) {
+        if (!pfCompile.ok) {
+          stats.errors++
+          logBag.error_code = pfCompile.code || 'invalid_messages_conversion'
+          logBag.error_message = pfCompile.error_body?.error?.message || 'Protocol conversion failed'
+          return json(
+            res,
+            pfCompile.status || 400,
+            pfCompile.error_body || { error: { code: logBag.error_code, message: logBag.error_message } },
+          )
+        }
+        const goBody = pfCompile.outbound_body
+        if (!goBody.max_tokens) goBody.max_tokens = defaultMaxTokensForModel(goBody.model)
+        if (protocol === 'openai.responses') normalizeThinkingByPolicy(goBody)
+        if (inferenceBackend !== 'api' && !officialPassthrough && Array.isArray(goBody.system)) {
+          const track = trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+          if (typeof track === 'function') {
+            for (let i = 0; i < goBody.system.length; i++) {
+              track(goBody.system[i], Array.isArray(ctx.body?.system) ? ctx.body.system[i] : ctx.body?.system)
+            }
+          }
+        }
+        converted = { claude: goBody, mode: pfCompile.mode === 'passthrough' ? 'passthrough' : 'convert' }
+      } else {
+        converted =
+          apiGemini || apiOpenAI
+            ? { claude: ctx.body, mode: 'passthrough' }
+            : toClaudeMessages(protocol, ctx.body, {
+                rewrite: rewriteEnabled,
+                model_map: false,
+                preserve_content_shape: officialPassthrough,
+                onSystemBlock:
+                  inferenceBackend !== 'api' && !officialPassthrough
+                    ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+                    : undefined,
+              })
+      }
     } catch (error) {
       if (
         !['invalid_responses_conversion', 'invalid_messages_conversion', 'thinking_incompatible'].includes(error.code)
@@ -1627,14 +1733,14 @@ export function createHandleProtocol(deps) {
       ? { stickyKey: null, stickyKeys: [] }
       : stickyRouter?.sessionPoolKeys
         ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
-          deviceId: stickyDeviceId,
-          migrate: !isProbe,
-        })
+            sessionId: inboundIdentity.sessionId,
+            deviceId: stickyDeviceId,
+            migrate: !isProbe,
+          })
         : {
-          stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
-          stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
-        }
+            stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
+            stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
+          }
     // Sessionless batch traffic: stick (key, workload) to a small elastic group
     // of accounts instead of fanning out over the pool. See pool/batch-group.mjs.
     let batchPick = null
@@ -1693,7 +1799,7 @@ export function createHandleProtocol(deps) {
     try {
       const disk = routingConfigPath ? readJsonParsedCached(routingConfigPath) : null
       if (disk) routingForCacheTtl = disk
-    } catch { }
+    } catch {}
     const requestedCacheTtl = pinConversationCacheTtl(
       stickyKey || callerSession || outboundSessionId,
       resolveCacheTtl({
@@ -1801,11 +1907,11 @@ export function createHandleProtocol(deps) {
         requestContext || apiNonAnthropic || preserveApiCallerBody
           ? 0
           : personaHideForUnofficial(personaIn, ctx.body, {
-            officialClient: officialPassthrough,
-            mode: personaMode,
-            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-            standing: standingUsageFromRoutingFile(routingConfigPath),
-          })
+              officialClient: officialPassthrough,
+              mode: personaMode,
+              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+              standing: standingUsageFromRoutingFile(routingConfigPath),
+            })
     }
 
     if (inferenceBackend === 'api') {
@@ -1873,7 +1979,7 @@ export function createHandleProtocol(deps) {
         if (managedKey) {
           try {
             apiKeyStore.release(managedKey)
-          } catch { }
+          } catch {}
         }
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
@@ -1947,12 +2053,12 @@ export function createHandleProtocol(deps) {
           output = apiOpenAI
             ? result.body
             : fromClaudeToResponses(
-              clientBody,
-              inbound.model,
-              result.endpointId,
-              converted.mode,
-              converted.responseTools,
-            )
+                clientBody,
+                inbound.model,
+                result.endpointId,
+                converted.mode,
+                converted.responseTools,
+              )
       }
       return sendPublicJson(output)
     }
@@ -1977,39 +2083,39 @@ export function createHandleProtocol(deps) {
 
     const clientAbort = bindClientAbort(req, res)
 
-    const clientStream = isClientStream(inbound, req.headers)
+    const clientStream = protocol === 'google.gemini' ? effectiveRouteStream : isClientStream(inbound, req.headers)
     const streamTracker = clientStream && protocol === 'anthropic.messages' ? createAnthropicStreamTracker() : null
     const anthropicSseErrorRemapper =
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
-          isStarted: () => streamTracker?.hasStarted() === true,
-          // The client is told to retry, so the real cause has to survive here or
-          // it survives nowhere: this relay path sets no other logBag fields, and
-          // a deterministic capture fault would otherwise read exactly like a
-          // transient disconnect while the client retries into it.
-          onRetryableTruncation: (payload, mapped) => {
-            const raw = payload?.error || payload || {}
-            logBag.client_error_type = 'rate_limit_error'
-            logBag.truncation_reason = 'mid_stream_error'
-            logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
-            logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
-          },
-        })
+            isStarted: () => streamTracker?.hasStarted() === true,
+            // The client is told to retry, so the real cause has to survive here or
+            // it survives nowhere: this relay path sets no other logBag fields, and
+            // a deterministic capture fault would otherwise read exactly like a
+            // transient disconnect while the client retries into it.
+            onRetryableTruncation: (payload, mapped) => {
+              const raw = payload?.error || payload || {}
+              logBag.client_error_type = 'rate_limit_error'
+              logBag.truncation_reason = 'mid_stream_error'
+              logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
+              logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
+            },
+          })
         : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-          intervalMs: streamKeepaliveMs,
-          userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
-          protocol,
-          write: (chunk) => {
-            if (res.writableEnded || res.destroyed) return
-            if (!res.headersSent) writeSSEHeaders(res)
-            res.write(chunk)
-          },
-        })
+            intervalMs: streamKeepaliveMs,
+            userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
+            protocol,
+            write: (chunk) => {
+              if (res.writableEnded || res.destroyed) return
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(chunk)
+            },
+          })
         : null
     anthropicKeepalive?.armAfter(queueKeepaliveDelay)
     const upstreamStream = true
@@ -2561,6 +2667,7 @@ export function createHandleProtocol(deps) {
             })
           }
           const publicStream = replayScope ? createIssuedToolStream() : null
+          const geminiCrossSseLines = protocol === 'google.gemini' ? [] : null
           let state
           if (protocol === 'openai.chat') {
             state = createOpenAIChatStreamState(inbound.model || body.model, candidate.vmId)
@@ -2638,6 +2745,10 @@ export function createHandleProtocol(deps) {
                     res.write(`${event}data: ${JSON.stringify(chunk)}\n\n`)
                   }
                 }
+                if (protocol === 'google.gemini') {
+                  geminiCrossSseLines.push(String(line).endsWith('\n') ? String(line) : `${line}\n`)
+                  return
+                }
                 if (protocol === 'openai.chat') {
                   writeChunks(claudeSSELineToOpenAIChatChunks(line, state))
                   return
@@ -2649,6 +2760,20 @@ export function createHandleProtocol(deps) {
                 writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
+            if (protocol === 'google.gemini' && streamed?.ok && geminiCrossSseLines?.length) {
+              const tc = await transcodeWithProtoFront({
+                cfg,
+                upstreamProtocol: 'anthropic.messages',
+                inboundProtocol: 'google.gemini',
+                model: inbound.model || body.model,
+                stream: true,
+                payload: geminiCrossSseLines.join(''),
+              })
+              if (tc?.ok && tc.body) {
+                if (!res.headersSent) writeSSEHeaders(res)
+                res.write(tc.body)
+              }
+            }
             if (streamed?.ok) rememberPublic(publicStream?.completedContent())
             return streamed
           } finally {
@@ -2663,7 +2788,7 @@ export function createHandleProtocol(deps) {
       if (managedKey) {
         try {
           apiKeyStore.release(managedKey)
-        } catch { }
+        } catch {}
       }
     }
 
@@ -2689,14 +2814,14 @@ export function createHandleProtocol(deps) {
           usage_complete: provider?.usage_complete === true,
           ...(provider?.schema_version === 2
             ? {
-              provider_complete: provider.provider_complete,
-              handoff_complete: provider.handoff_complete ?? null,
-              delivery_complete: provider.delivery_complete ?? null,
-              response_valid: provider.response_valid ?? null,
-              source: provider.source ?? null,
-              http_status: provider.http_status ?? null,
-              public_status: provider.public_status ?? null,
-            }
+                provider_complete: provider.provider_complete,
+                handoff_complete: provider.handoff_complete ?? null,
+                delivery_complete: provider.delivery_complete ?? null,
+                response_valid: provider.response_valid ?? null,
+                source: provider.source ?? null,
+                http_status: provider.http_status ?? null,
+                public_status: provider.public_status ?? null,
+              }
             : {}),
         },
       }
@@ -2766,7 +2891,7 @@ export function createHandleProtocol(deps) {
           const vm = getVm(cfg.paths.project, result.vmId)
           if (vm) pool.syncQuotaSchedule(vm)
         }
-      } catch { }
+      } catch {}
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
@@ -2786,7 +2911,7 @@ export function createHandleProtocol(deps) {
         res.write(`data: ${JSON.stringify(mapped.body)}\n\n`)
         return res.end()
       }
-      if (result?.ok && protocol !== 'anthropic.messages') {
+      if (result?.ok && protocol !== 'anthropic.messages' && protocol !== 'google.gemini') {
         res.write('data: [DONE]\n\n')
       }
       if (!result?.ok) {
@@ -2864,6 +2989,16 @@ export function createHandleProtocol(deps) {
       output = fromClaudeToOpenAIChat(clientBody, inbound.model, result.vmId, converted.mode)
     } else if (protocol === 'openai.completions') {
       output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
+    } else if (protocol === 'google.gemini') {
+      const tc = await transcodeWithProtoFront({
+        cfg,
+        upstreamProtocol: 'anthropic.messages',
+        inboundProtocol: 'google.gemini',
+        model: inbound.model || clientBody?.model || '',
+        stream: false,
+        payload: JSON.stringify(clientBody),
+      })
+      output = tc?.ok && tc.body ? JSON.parse(tc.body) : clientBody
     } else {
       output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode, converted.responseTools)
     }
@@ -2904,7 +3039,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch { }
+      } catch {}
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -2995,14 +3130,14 @@ export function createHandleProtocol(deps) {
     const keepalive =
       stream && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-          intervalMs: streamKeepaliveMs,
-          protocol,
-          write: (chunk) => {
-            if (responseClosed(res)) return
-            if (!res.headersSent) writeSSEHeaders(res)
-            res.write(chunk)
-          },
-        })
+            intervalMs: streamKeepaliveMs,
+            protocol,
+            write: (chunk) => {
+              if (responseClosed(res)) return
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(chunk)
+            },
+          })
         : null
     let reply = null
     try {
@@ -3094,7 +3229,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch { }
+      } catch {}
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
