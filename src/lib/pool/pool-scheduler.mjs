@@ -1599,7 +1599,12 @@ export class PoolScheduler extends EventEmitter {
     const now = Date.now()
     const ranked = this.planner
       .rank(candidates)
-      .map((candidate) => ({ candidate, score: weeklyPaceScore(candidate.account?.unified, now) ?? -1 }))
+      .map((candidate) => {
+        const { account, vm } = candidate
+        const policy = this.accountQuota?.policyFor?.(account, { tier: vmTierOf(vm) })
+        const limit = policy?.limit_7d ?? policy?.weekly_safety_ratio
+        return { candidate, score: weeklyPaceScore(account?.unified, now, limit) ?? -1 }
+      })
       .sort((left, right) => right.score - left.score)
     for (const strict of [true, false]) {
       for (const draining of [false, true]) {

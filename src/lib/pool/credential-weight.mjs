@@ -1,4 +1,4 @@
-import { headerWindowOrEmpty, officialWindow, parseResetMs, WINDOW_7D_MS } from './quota-window.mjs'
+import { headerWindow, headerWindowOrEmpty, officialWindow, parseResetMs, WINDOW_7D_MS } from './quota-window.mjs'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const MIN_LEVEL = 1
@@ -61,17 +61,28 @@ export function weeklyResetAt(unified = {}, now = Date.now()) {
   return parseResetMs(officialReset) > now ? officialReset : null
 }
 
-export function weeklyPaceScore(unified = {}, now = Date.now()) {
-  const windows = [headerWindowOrEmpty(unified, '7d', { now }), officialWindow(unified, '7d')]
+export function weeklyPaceScore(unified = {}, now = Date.now(), limit = 1) {
+  const official = officialWindow(unified, '7d')
+  const hasOfficialReading = official === unified?.official?.['7d'] || official === unified?.['7d']
+  const windows = [headerWindow(unified, '7d'), hasOfficialReading ? official : null]
+  let fallback = null
+  let resetObserved = false
   for (const window of windows) {
-    const remainingMs = parseResetMs(window.reset ?? window.resets_at) - now
-    if (!(remainingMs > 0) || window.utilization == null || window.utilization === '') continue
+    if (!window) continue
+    const resetMs = parseResetMs(window.reset ?? window.resets_at)
+    if (resetMs > 0 && resetMs <= now) {
+      resetObserved = true
+      continue
+    }
+    if (window.utilization == null || window.utilization === '') continue
     const used = Number(window.utilization)
     if (!Number.isFinite(used) || used < 0 || used > 100) continue
     const ratio = used > 1.5 ? used / 100 : used
-    return Math.max(0, 1 - ratio) / Math.min(1, remainingMs / WINDOW_7D_MS)
+    const available = Math.max(0, limit - ratio)
+    if (resetMs > now) return available / Math.min(1, (resetMs - now) / WINDOW_7D_MS)
+    fallback ??= available
   }
-  return null
+  return fallback ?? (resetObserved ? limit : null)
 }
 
 export function resolveCredentialScheduleLevel({

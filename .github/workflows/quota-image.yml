@@ -93,6 +93,7 @@ jobs:
             web/src/types/panel-vm.ts \
             web/src/features/settings/about-pane.tsx \
             web/src/components/layout/app-title.tsx \
+            test/unit/credential-weight.test.mjs \
             test/unit/pool-scheduler.test.mjs \
             test/unit/release.test.mjs > "$RUNNER_TEMP/quota.patch"
           test -s "$RUNNER_TEMP/quota.patch"
@@ -116,7 +117,7 @@ jobs:
         working-directory: upstream
         run: |
           npm ci --no-audit --no-fund
-          node --test test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs test/unit/release.test.mjs
+          node --test test/unit/credential-weight.test.mjs test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs test/unit/release.test.mjs
           sh -n scripts/panel-upgrade.sh
           bash -n "$GITHUB_WORKSPACE/fork/deploy/upgrade-quota.sh"
       - name: Build console

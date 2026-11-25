@@ -3577,6 +3577,15 @@ test('weekly pace allocates a new Claude conversation by quota per day and keeps
   existing.release()
 
   repo.set('account-2', account(0, -1))
+  const reset = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:weekly-reset',
+    allowWait: false,
+  })
+  assert.equal(reset.vmId, 'vm-02')
+  reset.release()
+
+  repo.set('account-2', { unified: {} })
   const unknown = await pool.selectAndReserve({
     model: 'claude-test',
     seatKey: 'seat:sess:weekly-missing-quota',

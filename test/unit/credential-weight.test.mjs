@@ -8,6 +8,7 @@ import {
   parseScheduleLevelInput,
   resolveCredentialScheduleLevel,
   setResetPriorityEnabled,
+  weeklyPaceScore,
   weeklyResetAt,
 } from '../../src/lib/pool/credential-weight.mjs'
 import { normalizePoolRouting, PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
@@ -43,6 +44,18 @@ test('weekly reset prefers a future live header and falls back to official usage
   assert.equal(weeklyResetAt(unified, NOW), headerReset)
   unified.headers['7d'].reset = new Date(NOW - 1).toISOString()
   assert.equal(weeklyResetAt(unified, NOW), officialReset)
+})
+
+test('weekly pace uses the slot limit and a full week for unopened windows', () => {
+  const expired = { headers: { '7d': { utilization: 0.85, reset: NOW - 1 } } }
+  const noReset = { official: { '7d': { utilization: 0.3 } } }
+  const active = { official: { '7d': { utilization: 0.3, reset: NOW + 3.5 * DAY_MS } } }
+  assert.equal(weeklyPaceScore(expired, NOW, 0.8), 0.8)
+  assert.equal(weeklyPaceScore(noReset, NOW, 0.8), 0.5)
+  assert.equal(weeklyPaceScore({ ...expired, ...noReset }, NOW, 0.8), 0.5)
+  assert.equal(weeklyPaceScore({ ...expired, ...active }, NOW, 0.8), 1)
+  assert.equal(weeklyPaceScore({ official: { '7d': { utilization: 0 } } }, NOW, 0.8), 0.8)
+  assert.equal(weeklyPaceScore({ official: { '5h': { utilization: 0 } } }, NOW, 0.8), null)
 })
 
 test('manual schedule level overrides automatic level and validates the public input', () => {
