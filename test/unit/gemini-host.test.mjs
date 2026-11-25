@@ -419,6 +419,9 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
     created_at: null,
     updated_at: null,
     runtime_ready: false,
+    schedulable: true,
+    schedule_level: 5,
+    schedule_level_mode: 'auto',
     models: [],
     billing_ready: false,
   })

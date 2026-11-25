@@ -381,7 +381,7 @@ try:
         def __init__(self):
             self.sent = None
 
-        def send_json_error(self, status, code=None, message=None):
+        def send_json_error(self, status, code=None, message=None, *, retry_after_ms=None):
             self.sent = (status, code, message)
 
     fake_session = FakeSession()
