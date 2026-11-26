@@ -3,6 +3,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
+import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
+import { syncVmFile } from '../../src/lib/vm/vm-db-sync.mjs'
+import { setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
 import { renameVmId } from '../../src/lib/vm/vm-rename.mjs'
 
 function seed(root, id, extra = {}) {
@@ -55,6 +59,26 @@ test('renameVmId refuses a running, remote, or taken slot', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('renameVmId updates live SQLite references for a stopped slot', (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-rename-sqlite-'))
+  context.after(() => {
+    setVmWriteHook(null)
+    closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const db = openDatabase({ dbPath: path.join(root, 'kin.db') })
+  const vms = new VmsRepo(db)
+  const slot = seed(root, 'slot-a')
+  vms.upsertFromVmJson(slot)
+  setVmWriteHook(syncVmFile)
+  db.prepare('INSERT INTO sticky_sessions (key, vm_id) VALUES (?, ?)').run('sess:rename', slot.id)
+
+  assert.equal(renameVmId(root, slot.id, 'vm-00').ok, true)
+  assert.equal(vms.get(slot.id), null)
+  assert.equal(vms.get('vm-00').id, 'vm-00')
+  assert.equal(db.prepare('SELECT vm_id FROM sticky_sessions WHERE key = ?').get('sess:rename').vm_id, 'vm-00')
 })
 
 test('renameVmId refuses an invalid id without writing', () => {

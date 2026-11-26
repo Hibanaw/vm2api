@@ -80,6 +80,7 @@ jobs:
             src/lib/pool/pool-scheduler.mjs
             src/lib/admin/panel-api.mjs
             src/lib/admin/release.mjs
+            src/lib/vm/vm-rename.mjs
             scripts/panel-upgrade.sh
           )
           git -C fork merge-base --is-ancestor "$baseline" "$patch_head"
@@ -102,6 +103,7 @@ jobs:
             test/unit/credential-weight.test.mjs \
             test/unit/pool-scheduler.test.mjs \
             test/unit/release.test.mjs \
+            test/unit/vm-rename.test.mjs \
             test/unit/public-status.test.mjs > "$RUNNER_TEMP/quota.patch"
           test -s "$RUNNER_TEMP/quota.patch"
           test "v$(tr -d '[:space:]' < upstream/VERSION)" = "$UPSTREAM_TAG"
@@ -128,6 +130,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           node --test test/unit/credential-weight.test.mjs test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs test/unit/release.test.mjs
+          node --test test/unit/vm-rename.test.mjs
           if [[ -f test/unit/public-status.test.mjs ]]; then node --test test/unit/public-status.test.mjs; fi
           sh -n scripts/panel-upgrade.sh
           bash -n "$GITHUB_WORKSPACE/fork/deploy/upgrade-quota.sh"

@@ -4,7 +4,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { isDbOpen, getDb } from '../db/database.mjs'
+import { isDbOpen, getDb, withTransaction } from '../db/database.mjs'
 import { atomicWriteJson, invalidateReadCache, invalidateVmSlotReadCache, isValidVmId } from './vm-file.mjs'
 import { removeVmFromDb } from './vm-db-sync.mjs'
 
@@ -57,7 +57,7 @@ export function retargetVmId(fromId, toId) {
   if (!isDbOpen()) return
   const db = getDb()
   const tables = tableNames(db)
-  const tx = db.transaction(() => {
+  withTransaction(db, () => {
     const move = (table) => {
       if (!tables.has(table) || !columnNames(db, table).has('vm_id')) return
       db.prepare(`UPDATE ${table} SET vm_id = ? WHERE vm_id = ?`).run(toId, fromId)
@@ -87,7 +87,6 @@ export function retargetVmId(fromId, toId) {
       }
     }
   })
-  tx()
 }
 
 /**
